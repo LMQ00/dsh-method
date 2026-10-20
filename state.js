@@ -56,8 +56,15 @@ const PROJECT_ROOT_MARKERS = ['.git'];
  */
 export function findProjectAnchor(cwd) {
 	const start = resolve(cwd);
+	// The home directory is never an acceptable anchor. A dotfiles repository at
+	// `~/.git` is common, and without this guard every plan from any project under
+	// home would land in `~/.method/plan.md` — outside the project, shared by every
+	// unrelated session, and almost impossible to notice.
+	const home = resolve(process.env.HOME ?? process.env.USERPROFILE ?? '');
+	const isHome = (directory) => home !== '' && directory === home;
 	let current = start;
 	for (;;) {
+		if (isHome(current)) return start;
 		for (const marker of PROJECT_ROOT_MARKERS) {
 			if (existsSync(join(current, marker))) return current;
 		}
@@ -99,20 +106,43 @@ function isPlainObject(value) {
 }
 
 /**
- * Normalize the pending-submission map of a persisted cache row. An older row
- * (before concurrency support) carries `pendingCall`/`pendingArguments` instead;
- * it is dropped rather than migrated, because a half-open call from a previous
- * process can never receive its result.
+ * Normalize the pending-submission record of a persisted cache row.
+ *
+ * This is a PLAIN OBJECT, not a Map, and that is a hard requirement rather than a
+ * style choice: the projection cache persists unit state through
+ * `snapshotJsonValue`, which rejects anything that is not lossless JSON. A Map
+ * makes `isJsonValue(state)` false even for the empty init state, so the whole
+ * session's checkpoint write fails and `flushSoft` only warns. A record gives the
+ * same per-call pairing with nothing exotic in it.
+ *
+ * An older row (before concurrency support) carried `pendingCall` /
+ * `pendingArguments`; those keys are simply ignored, because a half-open call from
+ * a previous process can never receive its result.
  * @param {unknown} value - the persisted `pending` field.
- * @returns {Map<string, string | null>} call id → arguments JSON.
+ * @returns {Record<string, string | null>} call id → arguments JSON.
  */
 function normalizePending(value) {
-	const pending = new Map();
-	if (value === null || typeof value !== 'object') return pending;
+	const pending = {};
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return pending;
 	for (const [callId, args] of Object.entries(value)) {
-		pending.set(callId, typeof args === 'string' ? args : null);
+		pending[callId] = typeof args === 'string' ? args : null;
 	}
 	return pending;
+}
+
+/**
+ * Delete one key from the pending record without mutating the input state, and
+ * return the arguments recorded for it.
+ * @param {Record<string, string | null>} pending - the current record.
+ * @param {string} callId - the call to remove.
+ * @returns {{pending: Record<string, string | null>, args: string | null}} the new record and the removed arguments.
+ */
+function withoutPending(pending, callId) {
+	const next = {};
+	for (const [key, args] of Object.entries(pending)) {
+		if (key !== callId) next[key] = args;
+	}
+	return { pending: next, args: pending[callId] ?? null };
 }
 
 /**
@@ -139,16 +169,18 @@ const stateSchema = {
 			running: running === null || running === undefined
 				? null
 				: { commandId: running.commandId, wanted: running.wanted },
-			// Pending submissions are a map so that concurrent `plan_submit` calls
+			// Pending submissions are a record so that concurrent `plan_submit` calls
 			// (the harness may dispatch tool calls in parallel) each keep their own
 			// arguments until their own `tool/result` arrives. The last successful
 			// result wins the plan, but no call is mispaired with another's result.
+			// A record, not a Map: see normalizePending for why that distinction is
+			// load-bearing.
 			pending: normalizePending(value.pending),
 			// A persisted plan must be a plain object; anything else (an array, a
 			// string left by a hand-edited cache) discards the row instead of
 			// seeding a fold that later indexing would trip over.
 			plan: isPlainObject(value.plan) ? value.plan : null,
-			revision: Number.isInteger(value.revision) ? value.revision : 0,
+			revision: Number.isInteger(value.revision) && value.revision >= 0 ? value.revision : 0,
 		};
 	},
 };
@@ -188,7 +220,7 @@ export function createMethodProjection(commandName, toolName) {
 		init: () => ({
 			active: false,
 			running: null,
-			pending: new Map(),
+			pending: {},
 			plan: null,
 			revision: 0,
 		}),
@@ -212,9 +244,13 @@ export function createMethodProjection(commandName, toolName) {
 				}
 				case 'tool/call': {
 					if (data.name !== toolName) return state;
-					const pending = new Map(state.pending);
-					pending.set(String(data.callId), typeof data.arguments === 'string' ? data.arguments : null);
-					return { ...state, pending };
+					return {
+						...state,
+						pending: {
+							...state.pending,
+							[String(data.callId)]: typeof data.arguments === 'string' ? data.arguments : null,
+						},
+					};
 				}
 				case 'tool/result': {
 					const callId = data.message !== null
@@ -222,12 +258,10 @@ export function createMethodProjection(commandName, toolName) {
 						&& typeof data.message.toolCallId === 'string'
 						? data.message.toolCallId
 						: null;
-					if (callId === null || !state.pending.has(callId)) return state;
-					const pending = new Map(state.pending);
-					const args = pending.get(callId);
-					pending.delete(callId);
+					if (callId === null || !Object.hasOwn(state.pending, callId)) return state;
+					const { pending, args } = withoutPending(state.pending, callId);
 					// A failed submission committed nothing, but its own entry still leaves
-					// the map so a later result for the same id cannot resurrect it.
+					// the record so a later result for the same id cannot resurrect it.
 					if (data.message.isError === true) return { ...state, pending };
 					const plan = parsePlanArguments(args);
 					if (plan === null) return { ...state, pending };

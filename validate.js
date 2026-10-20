@@ -148,26 +148,86 @@ export function rejectDuplicates(texts, path) {
  * @returns {string} the criterion.
  */
 export function requireObservableCompletion(doneWhen, path) {
-	const hasCodeSpan = /`[^`]+`/.test(doneWhen);
-	const hasCommand = /\b(?:npm|pnpm|yarn|node|npx|git|curl|bash|sh|python3?|pytest|vitest|jest|cargo|go|make|docker)\b/.test(doneWhen);
+	// The question is NOT "does this look technical". A travel plan's criterion
+	// "收到航空公司的订票确认邮件，含订单号" and a report plan's "收到三位评审人的
+	// 书面意见" are perfectly observable to a human — they name an artifact someone
+	// can look at. Judging only by code-shaped signals (commands, diffs, exit
+	// codes) silently makes this plugin a programming tool, which defeats its whole
+	// purpose. So the test is: does the criterion name something that can be
+	// SEEN — an artifact, a state, a value, or a third-party acknowledgement?
+	// A code span counts only when it holds something checkable: at least 2 chars
+	// and not pure Chinese prose. Otherwise "`确认一切正常`" would pass by wrapping
+	// a vague sentence in backticks, which is the cheapest possible bypass.
+	const hasCodeSpan = [...doneWhen.matchAll(/([\u0060])([^\u0060]+)\1/g)].some(([, , inner]) => {
+		const body = inner.trim();
+		if (body.length < 2) return false;
+		const cjk = (body.match(/[\u4e00-\u9fff]/g) ?? []).length;
+		// Predominantly Chinese text inside backticks is prose, not a symbol/value.
+		return cjk * 2 <= body.length;
+	});
+	// Only unambiguous executable names count. `go`, `sh`, and `make` were removed:
+	// they are ordinary words in English prose ("make it happen", "go ahead"), and
+	// `sh` is two letters, so keeping them let nearly any sentence qualify.
+	const hasCommand = /\b(?:npm|pnpm|yarn|npx|git|curl|wget|bash|zsh|python3?|pytest|vitest|jest|cargo|docker|kubectl|terraform|ansible|gradle|maven|msbuild)\b/.test(doneWhen);
+
 	// URLs are stripped before the path/file checks so a link ending in `.md` is not
-	// read as a local artifact — a link is not something the executor checks on
-	// disk. Stripping first also stops `//host/path.ext` from matching the path
-	// rule through its protocol slashes.
+	// read as an artifact — a link is not something the executor checks on disk.
+	// Stripping first also stops `//host/path.ext` from matching the path rule
+	// through its protocol slashes.
 	const withoutUrls = doneWhen.replace(/\bhttps?:\/\/\S+/gi, ' ');
-	// A path counts when it carries a separator and an extension-like tail. No
-	// whitespace is required on either side because the surrounding sentence is
-	// usually Chinese and has no spaces at all.
-	const hasPath = /(?:^|[^:\w])(?:\.{0,2}\/)?[\w.~-]+(?:\/[\w.~-]+)+\.[A-Za-z0-9]{1,8}\b/.test(withoutUrls);
-	// A bare file name with a known artifact extension is equally observable: a
-	// user checking "README.md exists" runs the same kind of check as a command.
-	const hasBareFile = /(?:^|[^\w./])[\w.-]*\.(?:md|txt|json|ya?ml|toml|lock|csv|log|png|jpe?g|svg|pdf|ts|js|mjs|cjs|tsx|jsx|py|go|rs|java|c|h|cpp|sh|sql|html|css)\b/i.test(withoutUrls);
-	const hasComparison = /(?:===?|!==?|>=?|<=?|返回|退出码|exit code|equals|matches)/.test(doneWhen);
-	if (!hasCodeSpan && !hasCommand && !hasPath && !hasBareFile && !hasComparison) {
+
+	// A local path or bare file name: an artifact on disk.
+	const hasPath = /(?:^|[^:\w.@])(?:\.{0,2}\/)[\w.~-]+(?:\/[\w.~-]+)*\.[A-Za-z0-9]{1,8}\b|(?:^|[^:\w.@])[\w.~-]+(?:\/[\w.~-]+)+\.[A-Za-z0-9]{1,8}\b/.test(withoutUrls)
+		&& !/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|cn|co|ai|app|xyz)(?:\/|\b)/i.test(withoutUrls);
+	const hasBareFile = /(?:^|[^\w./])[\w.-]*\.(?:md|txt|json|ya?ml|toml|lock|csv|log|png|jpe?g|svg|gif|pdf|docx?|xlsx?|pptx?|odt|ods|epub|mp[34]|mov|zip|tar|gz|eml|ics|ts|js|mjs|cjs|tsx|jsx|py|go|rs|java|c|h|cpp|sh|sql|html|css)\b/i.test(withoutUrls);
+
+	// A numeric or ordering comparison: "> 80%", "≤ 3 条", "至少 20 页".
+	// Evaluated against `withoutUrls`: a URL's own `=`, `>`, and query string must
+	// not satisfy this rule. Four spellings of "returns" were cut down to the
+	// measurable forms, because bare 返回 matched any sentence mentioning a return.
+	// Only comparisons between an actual value and something else count. A bare `<`
+	// or `>` used as an angle bracket (`<https://…>`) must not satisfy this, so each
+	// operator has to be followed by an operand.
+	const hasComparison = /(?:===?|!==?|≥|≤)(?:\s*[\w"'\u0060\u300c])|(?:>=?|<=?)\s*[\d\w]|(?:不超过|至少|不少于|不多于|大于|小于|等于)\s*[\d\w]|(?:退出码|返回码|返回值|状态码)为|[\u4e00-\u9fff\w]+\s*为\s*(?:true|false|null|\d+|[\u201c"'\u300c][^\u201d"'\u300d]+[\u201d"'\u300d]|[\w-]+)/.test(withoutUrls);
+
+	// A threshold with a unit: "20 页", "3 条记录", "95 分", "8000 元".
+	const hasQuantity = /\d+\s*(?:页|条|行|个|份|项|次|人|天|小时|分钟|元|块|%|％|分|条记录|字|篇|张|台|套|件)/.test(doneWhen);
+
+	// A concrete value that can be compared: a quoted string, a number, a version.
+	// A bare number or version is a checkable value. Quoted text counts only when it
+	// is not predominantly Chinese prose: "「完成」" is a vague word in quote marks,
+	// not a value somebody can compare against.
+	const hasQuoted = [...doneWhen.matchAll(/[\u0060"\u201c'\u300c]([^\u0060"\u201d'\u300d]{2,})[\u0060"\u201d'\u300d]/g)]
+		.some(([, body]) => {
+			const text = body.trim();
+			const cjk = (text.match(/[\u4e00-\u9fff]/g) ?? []).length;
+			return cjk * 2 <= text.length;
+		});
+	const hasValue = hasQuoted || /\bv?\d+(?:\.\d+)+\b|\b\d+\b/.test(doneWhen);
+
+	// An artifact named in prose WITHOUT an extension, which is the common case in
+	// non-technical domains: 邮件 / 订单号 / 报告 / 回执 / 签字 / 截图 / 确认函.
+	// This list is deliberately about verifiable deliverables, not domain jargon:
+	// every entry names something a person can look at to decide "done".
+	const hasArtifactNoun = /(?:邮件|电邮|回执|收据|发票|合同|订单|确认函|确认书|通知|报告|文档|文件|表格|清单|名单|方案|纪要|记录|截图|照片|录音|录像|链接|网址|二维码|签名|签字|盖章|盖章版|交付物|附件|反馈|意见|评审|审批|回复|答复|凭证|票据|行程单|预约|确认码|验证码|编号|序列号)/.test(doneWhen)
+		// "文档见 <url>" / "文档在 <url>" point at a document elsewhere; that is a
+		// reference, not an artifact this plan produces, so it must not qualify on
+		// the noun alone.
+		&& !/(?:文档|文件|记录|报告|链接|网址)\s*(?:见|在|位于)/.test(doneWhen)
+
+	// An explicit state change a human can confirm: 存在 / 已生成 / 已提交 / 已完成.
+	const hasStateChange = /(?:存在|已生成|已创建|已提交|已发出|已发送|已收到|收到|已完成|已通过|已批准|已签署|已上传|已发布|已确认|可以通过|能打开|能够打开|能正常|正常工作|正常运行|可访问|可用|做完了|跑通|通过(?:[\u4e00-\u9fff]{0,6})?(?:测试|验收|评审|检验|检测|验证|审查))/.test(doneWhen);
+
+	if (
+		!hasCodeSpan && !hasCommand && !hasPath && !hasBareFile
+		&& !hasComparison && !hasQuantity && !hasValue
+		&& !hasArtifactNoun && !hasStateChange
+	) {
 		throw new PlanError(
 			path,
-			'must name an observable check (a command, a file path, a quoted value, or a comparison) — '
-			+ 'a criterion nobody can run is not a criterion',
+			'must name an observable completion — something a person can look at and decide done: '
+			+ 'a command to run, a file or artifact to produce, a value to compare, or a state to confirm. '
+			+ 'Rejected because it names no artifact, value, or checkable state.',
 		);
 	}
 	return doneWhen;
@@ -359,14 +419,20 @@ export function validateVerification(raw, tasks) {
 		}
 		return {
 			task,
-			check: requireText(item.check, `verification[${index}].check`, MAX_BLOCK_CHARS),
+			// A check nobody can perform is not a check: it must name something runnable
+			// or observable, by the same rule a task's completion criterion follows.
+			check: requireObservableCompletion(
+				requireText(item.check, `verification[${index}].check`, MAX_BLOCK_CHARS),
+				`verification[${index}].check`,
+			),
 			expected: requireText(item.expected, `verification[${index}].expected`, MAX_BLOCK_CHARS),
 		};
 	});
 
-	const covered = new Set(checks.map((check) => check.task).filter((task) => task !== '*'));
-	if (!covered.has('*') && checks.some((check) => check.task === '*')) covered.add('*');
+	// One `*` check covers the whole plan, so it suppresses per-task coverage
+	// requirements; otherwise every task id must appear.
 	const hasGlobal = checks.some((check) => check.task === '*');
+	const covered = new Set(checks.map((check) => check.task));
 	const uncovered = tasks.map((task) => task.id).filter((id) => !hasGlobal && !covered.has(id));
 	if (uncovered.length > 0) {
 		throw new PlanError(
@@ -388,7 +454,13 @@ export function validateVerification(raw, tasks) {
  * @returns {object} the normalized plan.
  */
 export function validatePlan(raw) {
-	const args = requireObject(raw, 'plan');
+	// The two layers get distinct paths so a model that sent the inner plan without
+	// the `{ plan: … }` wrapper sees `arguments` in the message and can tell which
+	// level is wrong. Naming both `plan` made the error unactionable.
+	const args = requireObject(raw, 'arguments');
+	if (!Object.hasOwn(args, 'plan')) {
+		throw new PlanError('plan', 'missing: the arguments must be an object of the form { plan: { … } }');
+	}
 	const plan = requireObject(args.plan, 'plan');
 
 	const goal = validateGoal(plan.goal);

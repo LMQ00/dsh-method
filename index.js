@@ -23,7 +23,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import {
 	PROMPT_SECTION_NAME,
@@ -230,6 +231,96 @@ function planParameters() {
 	};
 }
 
+/** The plan parameter schema, built once: `plan_submit`'s registration wants it
+ * and the runtime validator wants the same object. */
+const PLAN_SCHEMA = planParameters();
+
+/* ------------------------------------------------------------------ */
+/* Argument validation                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Make `additionalProperties: false` and every other constraint in
+ * {@link planParameters} actually bind.
+ *
+ * `ctx.tools.register` validates only the `output` schema; it forwards
+ * `parameters` to the provider as-is and calls `execute` with the raw arguments.
+ * Only `defineTool` runs a validator, and that helper takes the DSL form, not the
+ * standard JSON Schema this tool declares. So without this step a plan carrying a
+ * misspelled key (`typo_field`) is accepted silently: `validatePlan` reads the
+ * keys it knows and ignores the rest, and the declared schema is decoration.
+ *
+ * Resolution is layered because `@deepseek-ai/dsh-tools` is a peer the profile
+ * does not link into `node_modules`, so a plain dynamic import from this bundle
+ * fails. The dsh CLI ships its own dependencies under
+ * `<dsh>/node_modules/@deepseek-ai/dsh-tools`, so the harness entry point on
+ * `process.argv[1]` locates it. If nothing resolves, the content validator in
+ * `validate.js` still runs: the plugin degrades to "shape not enforced" rather
+ * than failing to load.
+ */
+let schemaValidatorPromise;
+
+/**
+ * Resolve the harness's own JSON Schema validator.
+ * @returns {Promise<((schema: object, value: unknown, path: string) => string[]) | null>} the validator, or null.
+ */
+function loadSchemaValidator() {
+	if (schemaValidatorPromise !== undefined) return schemaValidatorPromise;
+	schemaValidatorPromise = (async () => {
+		const { dirname, join } = await import('node:path');
+		const { existsSync } = await import('node:fs');
+		const { pathToFileURL } = await import('node:url');
+
+		const candidates = ['@deepseek-ai/dsh-tools'];
+
+		// Walk up from the running harness entry point to the directory that holds
+		// the `@deepseek-ai` scope, then try both the sibling and the nested layout.
+		const entry = typeof process.argv[1] === 'string' ? process.argv[1] : '';
+		if (entry !== '') {
+			let current = dirname(entry);
+			for (;;) {
+				for (const candidate of [
+					join(current, 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'),
+					join(current, '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'),
+				]) {
+					if (existsSync(candidate)) candidates.push(pathToFileURL(candidate).href);
+				}
+				const parent = dirname(current);
+				if (parent === current) break;
+				current = parent;
+			}
+		}
+
+		for (const candidate of candidates) {
+			try {
+				const module = await import(candidate);
+				if (typeof module.validateJsonSchemaValue === 'function') return module.validateJsonSchemaValue;
+			} catch {
+				// Try the next candidate.
+			}
+		}
+		return null;
+	})();
+	return schemaValidatorPromise;
+}
+
+/**
+ * Reject arguments that violate the declared parameter schema.
+ * @param {object} schema - the tool's JSON Schema.
+ * @param {unknown} args - the model-supplied arguments.
+ */
+async function assertArgsMatchSchema(schema, args) {
+	const validate = await loadSchemaValidator();
+	if (validate === null) return;
+	const violations = validate(schema, args, '');
+	if (violations.length === 0) return;
+	throw new Error(
+		`计划被拒绝 — arguments do not match the declared schema:\n- ${violations.slice(0, 12).join('\n- ')}`
+		+ (violations.length > 12 ? `\n- …共 ${violations.length} 项` : '')
+		+ '\n字段名必须与 schema 完全一致（拼错的字段不会被读取）；修正后重新提交完整计划。',
+	);
+}
+
 /* ------------------------------------------------------------------ */
 /* Plugin                                                              */
 /* ------------------------------------------------------------------ */
@@ -239,6 +330,18 @@ function planParameters() {
  * @param {object} ctx - the plugin's Cordis context.
  */
 export function apply(ctx) {
+	/**
+	 * Revisions already handed out in THIS process, keyed by session.
+	 *
+	 * The projection's `revision` only advances when a `tool/result` folds, which
+	 * happens after `execute` returns. Two concurrent `plan_submit` calls would
+	 * therefore both read the same committed value and label two different plans
+	 * with one revision — and since both write the same file, the second silently
+	 * overwrites the first under a revision number that claims they are the same.
+	 * This counter reserves the next number synchronously, before the await points.
+	 */
+	const reservedRevisions = new WeakMap();
+
 	/** Read this session's method projection state, or `undefined` when unregistered. */
 	function stateOf(session) {
 		try {
@@ -274,8 +377,25 @@ export function apply(ctx) {
 		return state === undefined ? false : state.active === true;
 	}
 
-	/** The session's working directory, falling back to the host process cwd. */
+	/**
+	 * The session's EFFECTIVE working directory.
+	 *
+	 * `session.header.cwd` is only the directory the session was created with; when
+	 * the user runs `/cd` mid-session the harness records a
+	 * `working-directory/change` event and keeps the committed value in the
+	 * `workingDirectory` projection. Reading the header alone would keep writing the
+	 * plan to the directory the session started in, which is wrong after exactly the
+	 * moment the user moved into the project they want to plan.
+	 * @param {object} session - the session.
+	 * @returns {string} an absolute directory.
+	 */
 	function sessionCwd(session) {
+		try {
+			const projected = ctx.sessionProjections.stateOf(session, 'workingDirectory');
+			if (typeof projected === 'string' && projected !== '') return projected;
+		} catch {
+			// No working-directory service in this composition; fall back to the header.
+		}
 		try {
 			const cwd = session.header?.cwd;
 			if (typeof cwd === 'string' && cwd !== '') return cwd;
@@ -361,7 +481,7 @@ export function apply(ctx) {
 	ctx.tools.register({
 		name: PLAN_TOOL_NAME,
 		description: planToolDescription(),
-		parameters: planParameters(),
+		parameters: PLAN_SCHEMA,
 		output: {
 			schema: {
 				type: 'object',
@@ -386,6 +506,7 @@ export function apply(ctx) {
 			],
 		},
 		async execute(args, exec) {
+			await assertArgsMatchSchema(PLAN_SCHEMA, args);
 			const agent = exec.agent;
 			if (agent === undefined) {
 				throw new Error(`${PLAN_TOOL_NAME} 需要一个调用它的 agent（没有会话可以落盘）`);
@@ -407,13 +528,25 @@ export function apply(ctx) {
 			}
 
 			const state = stateOf(session);
-			const revision = (state?.revision ?? 0) + 1;
+			// Reserve a revision monotonically within this process so concurrent calls
+			// cannot share one number. The committed projection revision is the floor,
+			// because a resumed session may already be ahead of this process's counter.
+			const committed = state?.revision ?? 0;
+			const reserved = Math.max(committed, reservedRevisions.get(session) ?? 0) + 1;
+			reservedRevisions.set(session, reserved);
+			const revision = reserved;
 			const planPath = planPathFor(session);
 			const rendered = renderPlan(plan, revision);
 
 			try {
 				ensureParentDir(planPath);
 				writeFileSync(planPath, `${rendered}\n`, 'utf8');
+				// The plan lives inside the user's project. Writing a self-ignoring
+				// `.gitignore` next to it keeps `git status` clean without touching the
+				// project's own `.gitignore` — an edit the user never asked for and would
+				// have to review.
+				const ignorePath = join(dirname(planPath), '.gitignore');
+				if (!existsSync(ignorePath)) writeFileSync(ignorePath, '*\n', 'utf8');
 			} catch (error) {
 				throw new Error(`计划校验通过但落盘失败（${planPath}）：${error?.message ?? error}`);
 			}

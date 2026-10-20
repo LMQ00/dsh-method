@@ -15,6 +15,36 @@ import assert from 'node:assert/strict';
 import { createMethodProjection, parsePlanArguments } from './state.js';
 import { PlanError, renderPlan, validatePlan } from './validate.js';
 
+/**
+ * Assert a projection state is lossless JSON.
+ *
+ * This mirrors `snapshotJsonValue` in the harness: the projection cache serializes
+ * unit state, so anything exotic (a Map, a Set, a class instance, undefined, a
+ * cycle) makes the write fail and `flushSoft` swallows it as a warning. The check
+ * is written out rather than imported so the test has no absolute-path dependency
+ * on this machine's dsh installation, but it enforces the same rule: a JSON
+ * round-trip must reproduce the value exactly.
+ * @param {unknown} state - the projection state to check.
+ * @param {string} label - context for the failure message.
+ */
+function assertLosslessJson(state, label) {
+	let roundTripped;
+	try {
+		roundTripped = JSON.parse(JSON.stringify(state));
+	} catch (error) {
+		throw new Error(`${label}: state is not JSON-serializable (${error.message})`);
+	}
+	assert.deepEqual(
+		roundTripped,
+		state,
+		`${label}: state must survive a JSON round-trip unchanged (a Map/Set/undefined breaks the projection checkpoint)`,
+	);
+	for (const value of Object.values(state)) {
+		assert.notEqual(value?.constructor?.name, 'Map', `${label}: ${value?.constructor?.name} is not lossless JSON`);
+		assert.notEqual(value?.constructor?.name, 'Set', `${label}: ${value?.constructor?.name} is not lossless JSON`);
+	}
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -141,7 +171,7 @@ check('任务多于最小值也通过', () => {
 
 check('单个 "*" 验证项可覆盖全部任务', () => {
 	const payload = validPlan();
-	payload.plan.verification = [{ task: '*', check: '完整跑一遍构建', expected: '构建成功且无 warning' }];
+	payload.plan.verification = [{ task: '*', check: '`pnpm build` 退出码为 0', expected: '退出码为 0，无 warning' }];
 	const plan = validatePlan(payload);
 	assert.equal(plan.verification.length, 1);
 });
@@ -260,6 +290,76 @@ check('完成判定可为退出码比较', () => {
 	assert.ok(validatePlan(payload).tasks[0].doneWhen.includes('退出码'));
 });
 
+check('非技术领域的可观察判定被接受（旅行规划）', () => {
+	for (const criterion of [
+		'收到航空公司的订票确认邮件，含订单号',
+		'收到酒店预订确认邮件',
+		'行程单.pdf 已生成',
+		'合同已签署',
+	]) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		assert.ok(validatePlan(payload).tasks[0].doneWhen === criterion, `should accept ${criterion}`);
+	}
+});
+
+check('非技术领域的可观察判定被接受（报告交付）', () => {
+	for (const criterion of [
+		'report/q3.docx 存在且不少于 20 页',
+		'收到三位评审人的书面意见',
+		'报告已发送给张总',
+		'页面能打开',
+	]) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		assert.ok(validatePlan(payload).tasks[0].doneWhen === criterion, `should accept ${criterion}`);
+	}
+});
+
+check('反引号包裹空话不能绕过（BUG-4）', () => {
+	for (const criterion of ['`确认一切正常`', '`好`', '``', '「完成」']) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		rejects(() => validatePlan(payload), 'tasks[0].doneWhen', criterion);
+	}
+});
+
+check('英文散文里的歧义命令词不能绕过（BUG-4）', () => {
+	for (const criterion of ['make it happen', 'go', 'sh', '返回', '把结果返回给用户']) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		rejects(() => validatePlan(payload), 'tasks[0].doneWhen', criterion);
+	}
+});
+
+check('URL 不能靠自身符号或裸域名绕过（BUG-5）', () => {
+	for (const criterion of ['<https://a.com/x.md>', '见 example.com/notes.md', '文档见 https://a.com']) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		rejects(() => validatePlan(payload), 'tasks[0].doneWhen', criterion);
+	}
+});
+
+check('人的验收类判定被接受（BUG-1 修正后的正向覆盖）', () => {
+	for (const criterion of [
+		'客户在验收单上签字',
+		'样机通过跌落测试',
+		'医生确认体检报告无异常项',
+	]) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		assert.ok(validatePlan(payload).tasks[0].doneWhen === criterion, `should accept ${criterion}`);
+	}
+});
+
+check('无数值无产物的空话被拒绝', () => {
+	for (const criterion of ['确认一切正常', '完成', '继续努力', '看看效果如何', '努力做好']) {
+		const payload = validPlan();
+		payload.plan.tasks[0].doneWhen = criterion;
+		rejects(() => validatePlan(payload), 'tasks[0].doneWhen', criterion);
+	}
+});
+
 check('仅凭 URL 不构成可观察判定', () => {
 	const payload = validPlan();
 	payload.plan.tasks[0].doneWhen = '见 https://example.com/notes.md 的说明';
@@ -352,18 +452,108 @@ check('字段超长被拒绝', () => {
 	rejects(() => validatePlan(payload), 'goal.statement');
 });
 
+check('MAX_FIELD_CHARS=400 的边界（单行字段）', () => {
+	const payload = validPlan();
+	payload.plan.tasks[0].title = 'x'.repeat(401);
+	rejects(() => validatePlan(payload), 'tasks[0].title');
+	const ok = validPlan();
+	ok.plan.tasks[0].title = 'y'.repeat(400);
+	assert.equal(validatePlan(ok).tasks[0].title.length, 400, 'exactly at the limit must pass');
+});
+
+check('requireText 拒绝非字符串', () => {
+	const payload = validPlan();
+	payload.plan.goal.statement = 42;
+	rejects(() => validatePlan(payload), 'goal.statement');
+	const asArray = validPlan();
+	asArray.plan.alternatives.reason = ['not', 'a', 'string'];
+	rejects(() => validatePlan(asArray), 'alternatives.reason');
+});
+
+check('requireObject 拒绝数组', () => {
+	const payload = validPlan();
+	payload.plan.alternatives = [];
+	rejects(() => validatePlan(payload), 'alternatives');
+	const taskAsArray = validPlan();
+	taskAsArray.plan.tasks[1] = [];
+	rejects(() => validatePlan(taskAsArray), 'tasks[1]');
+});
+
+check('requireObject 拒绝 null 与基本类型', () => {
+	for (const bad of [null, 7, 'str', true]) {
+		const payload = validPlan();
+		payload.plan.constraints[0] = bad;
+		rejects(() => validatePlan(payload), 'constraints[0]');
+	}
+});
+
 check('null 输入被拒绝', () => {
-	rejects(() => validatePlan(null), 'plan');
+	rejects(() => validatePlan(null), 'arguments');
 });
 
 check('数组输入被拒绝', () => {
-	rejects(() => validatePlan([]), 'plan');
+	rejects(() => validatePlan([]), 'arguments');
+});
+
+check('错误路径能区分外层与内层（BUG-3）', () => {
+	// Missing wrapper names `plan`; a broken wrapper names `arguments`. A model
+	// reading the message must be able to tell which level to repair.
+	let outer;
+	try { validatePlan({}); } catch (error) { outer = error.path; }
+	assert.equal(outer, 'plan');
+	let inner;
+	try { validatePlan(null); } catch (error) { inner = error.path; }
+	assert.equal(inner, 'arguments');
+	let wrongType;
+	try { validatePlan({ plan: [] }); } catch (error) { wrongType = error.path; }
+	assert.equal(wrongType, 'plan');
 });
 
 check('非对象任务被拒绝', () => {
 	const payload = validPlan();
 	payload.plan.tasks[0] = 'inspect';
 	rejects(() => validatePlan(payload), 'tasks[0]');
+});
+
+console.log('\n投影状态必须是无损 JSON（投影缓存契约）');
+check('每个折叠阶段的 state 都能 JSON 往返', () => {
+	const projection = createMethodProjection('method', 'plan_submit');
+	let state = projection.init();
+	assertLosslessJson(state, 'init');
+
+	state = projection.apply(state, { type: 'command/run', data: { name: 'method', args: '', commandId: 'c1' } });
+	assertLosslessJson(state, 'after command/run');
+
+	state = projection.apply(state, { type: 'command/done', data: { commandId: 'c1', kind: 'success' } });
+	assertLosslessJson(state, 'after command/done');
+
+	state = projection.apply(state, { type: 'tool/call', data: { name: 'plan_submit', callId: 'A', arguments: JSON.stringify(validPlan()) } });
+	assertLosslessJson(state, 'after tool/call (pending populated)');
+
+	state = projection.apply(state, { type: 'tool/call', data: { name: 'plan_submit', callId: 'B', arguments: JSON.stringify(validPlan()) } });
+	assertLosslessJson(state, 'after a second concurrent tool/call');
+
+	state = projection.apply(state, { type: 'tool/result', data: { message: { toolCallId: 'A', isError: false } } });
+	assertLosslessJson(state, 'after tool/result (plan committed)');
+});
+
+check('pending 是普通对象而不是 Map', () => {
+	const projection = createMethodProjection('method', 'plan_submit');
+	const state = projection.init();
+	assert.equal(Object.getPrototypeOf(state.pending), Object.prototype, 'pending must be a plain record');
+	assert.equal(state.pending.constructor, Object);
+});
+
+check('stateSchema.parse 的输出也是无损 JSON', () => {
+	const projection = createMethodProjection('method', 'plan_submit');
+	const parsed = projection.stateSchema.parse({
+		active: true,
+		running: null,
+		pending: { A: '{}' },
+		plan: { goal: { statement: 'x' } },
+		revision: 2,
+	});
+	assertLosslessJson(parsed, 'stateSchema.parse output');
 });
 
 console.log('\n投影折叠');
@@ -415,14 +605,14 @@ check('成功的 plan_submit 提交计划并递增 revision', () => {
 		type: 'tool/call',
 		data: { name: 'plan_submit', callId: 't1', arguments: JSON.stringify(payload) },
 	});
-	assert.ok(state.pending.has('t1'));
+	assert.ok(Object.hasOwn(state.pending, 't1'));
 	state = projection.apply(state, {
 		type: 'tool/result',
 		data: { message: { toolCallId: 't1', isError: false } },
 	});
 	assert.equal(state.revision, 1);
 	assert.equal(state.plan.goal.statement, payload.plan.goal.statement);
-	assert.equal(state.pending.size, 0);
+	assert.equal(Object.keys(state.pending).length, 0);
 });
 
 check('失败的 plan_submit 不提交', () => {
@@ -470,14 +660,14 @@ check('并发两个 plan_submit 各自配对', () => {
 	second.plan.goal.statement = '第二份并发计划';
 	state = projection.apply(state, { type: 'tool/call', data: { name: 'plan_submit', callId: 't1', arguments: JSON.stringify(first) } });
 	state = projection.apply(state, { type: 'tool/call', data: { name: 'plan_submit', callId: 't2', arguments: JSON.stringify(second) } });
-	assert.equal(state.pending.size, 2, 'both calls must stay pending');
+	assert.equal(Object.keys(state.pending).length, 2, 'both calls must stay pending');
 	state = projection.apply(state, { type: 'tool/result', data: { message: { toolCallId: 't1', isError: false } } });
 	assert.equal(state.revision, 1, 'first result must commit its own plan');
 	assert.equal(state.plan.goal.statement, first.plan.goal.statement);
 	state = projection.apply(state, { type: 'tool/result', data: { message: { toolCallId: 't2', isError: false } } });
 	assert.equal(state.revision, 2, 'second result must not be lost');
 	assert.equal(state.plan.goal.statement, '第二份并发计划');
-	assert.equal(state.pending.size, 0);
+	assert.equal(Object.keys(state.pending).length, 0);
 });
 
 check('并发中失败的那个不提交、也不影响另一个', () => {
@@ -487,7 +677,7 @@ check('并发中失败的那个不提交、也不影响另一个', () => {
 	state = projection.apply(state, { type: 'tool/call', data: { name: 'plan_submit', callId: 't2', arguments: JSON.stringify(validPlan()) } });
 	state = projection.apply(state, { type: 'tool/result', data: { message: { toolCallId: 't1', isError: true } } });
 	assert.equal(state.revision, 0);
-	assert.equal(state.pending.size, 1, 'the failed call leaves, the live one stays');
+	assert.equal(Object.keys(state.pending).length, 1, 'the failed call leaves, the live one stays');
 	state = projection.apply(state, { type: 'tool/result', data: { message: { toolCallId: 't2', isError: false } } });
 	assert.equal(state.revision, 1);
 });
@@ -497,7 +687,7 @@ check('乱序 tool/result 被忽略', () => {
 	let state = projection.init();
 	state = projection.apply(state, { type: 'tool/call', data: { name: 'plan_submit', callId: 't1', arguments: '{"plan":{}}' } });
 	state = projection.apply(state, { type: 'tool/result', data: { message: { toolCallId: 'other', isError: false } } });
-	assert.ok(state.pending.has('t1'), 'an unrelated result must not clear the pending call');
+	assert.ok(Object.hasOwn(state.pending, 't1'), 'an unrelated result must not clear the pending call');
 	assert.equal(state.revision, 0);
 });
 
