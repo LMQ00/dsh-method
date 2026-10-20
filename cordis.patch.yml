@@ -1,0 +1,4 @@
+# dsh-method bundle patch — mounts the plugin row into the profile.
+- insert:
+    - id: method
+      name: dsh-method

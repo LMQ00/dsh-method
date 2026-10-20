@@ -1,0 +1,39 @@
+{
+  "name": "dsh-method",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "General-purpose method for the DeepSeek Harness: a domain-neutral planning protocol whose plan structure is enforced by schema and validator, not just requested by prose.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LMQ00/dsh-method.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "method",
+    "planning"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "state.js",
+    "validate.js",
+    "methodology.js",
+    "cordis.patch.yml",
+    "selftest.mjs",
+    "README.md",
+    "LICENSE",
+    "docs/*.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
