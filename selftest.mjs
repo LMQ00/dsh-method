@@ -439,6 +439,176 @@ await (async () => {
 	rmSync(dir, { recursive: true, force: true });
 })();
 
+
+/* ---------------- 网页面板（假 DOM / 假 react） ---------------- */
+
+/**
+ * 造一个能跑 client.js 的浏览器环境。
+ * @param {object} payload 路由要返回的数据。
+ * @returns {object} 环境句柄。
+ */
+function makeBrowser(payload) {
+	const registrations = [];
+	const disposers = [];
+	const elements = [];
+	globalThis.window = {
+		__ModuleLoader__: { load: (registration) => { globalThis.__clientModule = registration; } },
+		matchMedia: () => ({ matches: false }),
+	};
+	globalThis.document = {
+		getElementById: () => null,
+		createElement: () => {
+			const element = { style: {}, textContent: '', id: '' };
+			elements.push(element);
+			return element;
+		},
+		head: { appendChild: () => {} },
+	};
+	globalThis.fetch = async () => ({ ok: true, json: async () => payload });
+	const reactFake = {
+		createElement(type, props, ...children) {
+			return { type, props: props ?? {}, children: children.flat(Infinity).filter((child) => child !== null && child !== undefined) };
+		},
+		useRef: (value) => ({ current: value }),
+		useEffect: () => {},
+		useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+	};
+	const ctx = {
+		slots: {
+			inject: (name, callback) => callback(),
+			register: (options, component) => {
+				registrations.push({ options, component });
+				return () => {
+					const index = registrations.findIndex((item) => item.options === options);
+					if (index !== -1) registrations.splice(index, 1);
+				};
+			},
+		},
+		effect: (fn) => {
+			const dispose = fn();
+			disposers.push(dispose);
+			return dispose;
+		},
+	};
+	return { registrations, disposers, elements, reactFake, ctx };
+}
+
+/** 把 client.js 当浏览器模块加载一遍（每次加 query 拿新实例）。 */
+async function loadClient(payload) {
+	const browser = makeBrowser(payload);
+	await import('./client.js?case=' + encodeURIComponent(String(Date.now()) + Math.random()));
+	const factory = globalThis.__clientModule.factory;
+	const moduleExports = factory((name) => {
+		if (name === 'react') return browser.reactFake;
+		if (name === 'react/jsx-runtime') return browser.reactFake;
+		throw new Error('未预期的 require：' + name);
+	});
+	return { ...browser, moduleExports };
+}
+
+/** 等一小会儿，让轮询落地。 */
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+await (async () => {
+	const payload = {
+		cwd: '/tmp/x',
+		enabled: true,
+		selectedChart: 'plan-a',
+		stage: '实现中',
+		next: '等 n2',
+		members: [{ name: 'coder', role: '写模块', status: '进行中' }],
+		charts: [{ id: 'plan-a', name: '方案 A' }],
+		nodes: [{ id: 'n1', title: '查资料', status: '完成' }, { id: 'n2', title: '写结论', status: '进行中' }],
+		edges: [{ from: 'n1', to: 'n2' }],
+	};
+	const loaded = await loadClient(payload);
+	loaded.moduleExports.apply(loaded.ctx);
+	await sleep(50);
+
+	check('模式开着时挂上两个入口', () => {
+		const names = loaded.registrations.map((item) => item.options.name).sort();
+		equal(names, ['main', 'sidebar.panellist'], '注册的槽位');
+		equal(loaded.registrations.some((item) => item.options.key === 'orchestrate'), true, '全屏页的 key');
+		equal(loaded.registrations.some((item) => item.options.id === 'orchestrate'), true, '侧边栏入口的 id');
+	});
+
+	check('全屏页画出节点与连线', () => {
+		const page = loaded.registrations.find((item) => item.options.name === 'main').component();
+		const stack = [];
+		const walk = (node) => {
+			if (node === null || typeof node !== 'object') return;
+			if (Array.isArray(node)) {
+				for (const child of node) walk(child);
+				return;
+			}
+			// 假 createElement 不会自己渲染函数组件，这里手动展开一层。
+			if (typeof node.type === 'function') {
+				walk(node.type(node.props));
+				return;
+			}
+			stack.push(node);
+			walk(node.children ?? []);
+		};
+		walk(page);
+		const svg = stack.find((node) => node.type === 'svg');
+		if (svg === undefined) throw new Error('没有画出 svg');
+		const groups = stack.filter((node) => node.type === 'g' && node.props['data-status'] !== undefined);
+		equal(groups.length, 2, '节点数');
+		equal(groups.map((node) => node.props['data-status']).sort(), ['完成', '进行中'], '节点状态');
+		const stage = stack.find((node) => node.children.includes('实现中'));
+		if (stage === undefined) throw new Error('没画阶段一句话');
+	});
+
+	check('样式只插一次', () => equal(loaded.elements.filter((element) => element.id === 'dsh-orchestrate-style').length, 1, '样式标签数'));
+	for (const dispose of loaded.disposers) if (typeof dispose === 'function') dispose();
+})();
+
+await (async () => {
+	const loaded = await loadClient({ cwd: '/tmp/x', enabled: false, selectedChart: null, stage: '', next: '', members: [], charts: [], nodes: [], edges: [] });
+	loaded.moduleExports.apply(loaded.ctx);
+	await sleep(50);
+	check('模式关着时不挂入口', () => equal(loaded.registrations.length, 0, '注册数'));
+	for (const dispose of loaded.disposers) if (typeof dispose === 'function') dispose();
+})();
+
+await (async () => {
+	const loaded = await loadClient({
+		cwd: '/tmp/x',
+		enabled: true,
+		selectedChart: null,
+		stage: '',
+		next: '',
+		members: [],
+		charts: [{ id: 'plan-a', name: '方案 A' }],
+		nodes: [],
+		edges: [],
+	});
+	loaded.moduleExports.apply(loaded.ctx);
+	await sleep(50);
+	check('有方案没选中时给一句说明', () => {
+		const page = loaded.registrations.find((item) => item.options.name === 'main').component();
+		const texts = [];
+		const walk = (node) => {
+			if (node === null || typeof node !== 'object') return;
+			if (Array.isArray(node)) {
+				for (const child of node) walk(child);
+				return;
+			}
+			if (typeof node.type === 'function') {
+				walk(node.type(node.props));
+				return;
+			}
+			for (const child of node.children ?? []) if (typeof child === 'string') texts.push(child);
+			walk(node.children ?? []);
+		};
+		walk(page);
+		if (!texts.some((text) => text.includes('还没选中'))) throw new Error('没提示「还没选中」：' + texts.join(' | '));
+	});
+	for (const dispose of loaded.disposers) if (typeof dispose === 'function') dispose();
+})();
+
 /* ---------------- 结果 ---------------- */
 
 if (failures.length > 0) {
