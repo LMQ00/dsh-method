@@ -1,108 +1,82 @@
 # dsh-method
 
-给 DeepSeek Harness 一个**通用做事方法**：任何非平凡任务先产出结构化执行计划，计划的结构由 schema 与校验器强制，不是靠提示词请求。
-
-产出的是**最普遍**的计划，不是最快的。换领域、换执行者仍然成立。
-
-## 为什么
-
-快的方法都靠省略：省掉目标澄清、省掉方案比较、省掉约束、省掉验证。这些省略在自己熟悉的领域看不出来，换到不熟悉的领域就变成返工。
-
-这个插件把这几项变成**必填且机器校验**，所以模型省不掉。
+DeepSeek Harness 的子代理编排插件。敲 `/orchestrate` 之后，主对话只做两件事：给任务路由模型、给任务调度成员；成员交方案流程图，主对话选中一张、点亮节点，网页和手机面板看同一份进度。
 
 ## 装
 
-本仓库**未发布到 npm**，只能从源码 clone 后以链接方式安装：
-
 ```sh
-git clone https://github.com/LMQ00/dsh-method.git ~/Projects/dsh-method
-dsh plugin --profile web add link:~/Projects/dsh-method
+dsh plugin --profile web add /path/to/dsh-method
 ```
 
-装完重启 `dsh web`。profile 的 `node_modules` 里应有 `dsh-method` 软链——`link:` 装完若缺这条软链，`dsh web` 会打印 `cannot resolve profile bundle "dsh-method"` 并跳过该 bundle，重装一次即可。
+改完代码：宿主侧（index.js、store.js、schema.js、prompt.js）重启引擎；客户端（client.js）刷新页面。
 
 ## 用
 
-```
-/method            # 开启，直接说要做的事
-/method off        # 关闭
-```
+| 做什么 | 怎么用 |
+| --- | --- |
+| 开启 | `/orchestrate`，后面可以跟这次要做的事 |
+| 关闭 | `/orchestrate off`。提示词段撤下、面板入口隐藏，进度留在盘上 |
+| 看进度 | 网页侧边栏的「编排」图标；手机 App 对话详情页「插件」页签的「编排」面板 |
 
-开启后模型必须调用 `plan_submit` 提交计划。计划通过校验会落盘到 `<项目根>/.method/plan.md` 并把渲染后的全文回给模型，之后按计划执行。
+主对话派活走宿主自己的 `spawn_teammate`；团队子代理没开时回退到 `subagent`，由主对话中转。派谁、派几个、要不要审查，都不写死。
 
-## 计划被强制包含什么
+主对话手上的读写工具不拦。它自己调 `write` / `edit` 这类工具时，插件回一条 notice 说明这活该派给成员，调用照常执行。成员写文件不触发警告。
 
-| 项 | 规则 | 违反时 |
+## 两个工具
+
+### chart_submit
+
+出方案的成员用。一张图就是一份方案。
+
+| 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| 目标 | 一句话说清完成后的状态 | 拒绝 |
-| 非目标 | ≥1 条明确不做的 | 拒绝 |
-| 约束 | ≥1 条，标 `hard` / `soft` | 拒绝 |
-| 方案比较 | ≥2 个候选，各写优点与代价，选中项必须是其中之一 | 拒绝 |
-| 任务 | ≥2 个，id 唯一，依赖不许成环 | 拒绝 |
-| 每任务失败原因 | ≥1 条 | 拒绝 |
-| 每任务完成判定 | 必须可观察：一条命令 / 一个文件路径 / 一个数值比较 | 拒绝 |
-| 验证 | 每任务都被覆盖，或一条 `task: "*"` 覆盖整体 | 拒绝 |
-| 可逆性 / 置信度 | 布尔 + `high\|medium\|low` | 拒绝 |
+| `plan.id` | 字符串 | 方案 id，也是存档文件名：`[a-z0-9-]`，最多 40 字符 |
+| `plan.name` | 字符串 | 方案显示名 |
+| `nodes` | 数组 | `{ id, title }`，至少一个，id 图内唯一 |
+| `edges` | 数组 | `{ from, to }`，两端必须出现在 nodes 里；单步方案给 `[]` |
 
-「可观察」的判定标准是结构化的，覆盖技术与非技术两类：
+只校验字段齐全与连线引用，不查节点数量、不查唯一入口、不查环。被拒时报错点名缺哪项。
 
-| 类型 | 例子 |
-| --- | --- |
-| 命令 / 退出码 | `` `pnpm test` 退出码为 0 `` |
-| 文件 / 产物 | `docs/plan.md 存在`、`report/q3.docx 不少于 20 页` |
-| 数值 / 阈值 | `测试覆盖率 ≥ 80%`、`输出 42 行` |
-| 对比 / 状态值 | `accepted 为 true`、`返回码为 0` |
-| 他人确认 / 交付物 | `收到订票确认邮件`、`合同已签署`、`客户在验收单上签字` |
-| 状态达成 | `页面能打开`、`样机通过跌落测试` |
+### chart_update
 
-`确认一切正常`、`` `好` ``、`go`、`make it happen`、`随便看看`、`「完成」` 这类只有形容词和程度副词、既不指向对象也不指向状态的空话会被拒绝。
+主对话用，一次可以改四类东西，至少给一项。
 
-## 两层强制
-
-| 层 | 拒绝什么 | 在哪 |
+| 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| JSON Schema | 形状错：缺字段、类型错、枚举非法、多余字段 | provider 侧，`execute` 之前 |
-| `validate.js` | 内容错：空串、条目不够、判定不可观察、依赖成环、验证没覆盖 | `execute` 内 |
+| `selectedChart` | 字符串 | 必须是已交上来的方案 id |
+| `stage` | 字符串 | 当前阶段，一句话 |
+| `next` | 字符串 | 下一步等什么，一句话 |
+| `members` | 数组 | `{ name, role?, status? }`，整份替换 |
+| `nodes` | 对象 | `{ "n1": { "status": "完成" } }`，只写要改的节点 |
 
-Schema 用标准 JSON Schema（`required` 是字符串数组），**不是** `defineTool` 的 DSL。用 DSL 写法（属性上 `required: true`）会被 provider 拒绝：`Invalid schema for function 'plan_submit': true is not of type 'array'`。
+`status` 只有四个值：`待办` / `进行中` / `完成` / `失败`。没选中图就改节点会被拒。
 
-## 结构
+## 状态文件
 
-| 文件 | 职责 |
+项目根（最近的带 `.git` 的上级目录）下的 `.orchestrate/`：
+
+| 文件 | 内容 |
 | --- | --- |
-| `index.js` | 插件入口：`/method` 命令、`plan_submit` 工具、`method:policy` 提示词段 |
-| `validate.js` | 计划内容校验，纯函数 |
-| `state.js` | 会话投影（从会话日志折叠状态）+ 计划路径解析 |
-| `methodology.js` | 提示词文本 |
-| `selftest.mjs` | 68 项自测，全部执行真实代码 |
-| `docs/插件说明.md` | 做什么、怎么用、计划必含什么、拦什么不拦什么、限制 |
-| `docs/实现逻辑.md` | 状态模型、两层校验、判定判据、路径解析、渲染格式、宿主接口面 |
-| `AGENTS.md` | 文档索引 + 开发规范，改代码前必读 |
+| `state.json` | 选中图、阶段、下一步、成员清单、节点状态、候选方案索引 |
+| `plans/<id>.json` | 成员提交的原始方案 |
+| `.gitignore` | 内容为 `*`，让 `git status` 保持干净 |
 
-## 状态怎么存
+状态只能通过这两个工具写。写盘是「临时文件 + rename」。
 
-`sessionProjections` 从会话日志折叠，不自造事件类型——DSH 的持久化读路径会拒绝未知事件类型（除非带 `ignorable: true`，而 `Session.append()` 设不了）。
+同一份内容会镜像到 `$DSH_HOME/dsh-go/orchestrate/mirror.json`，手机 App 的原生面板读它。
 
-| 事件 | 作用 |
-| --- | --- |
-| `command/run`（`name: method`） | 记录待生效的选择 |
-| `command/done`（配对 id） | `success` 才提交选择 |
-| `tool/call`（`plan_submit`） | 按 `callId` 记下 `arguments` |
-| `tool/result`（配对 id） | 非错误则解析该次的 `arguments` 并提交计划 |
+## 网页面板
 
-待提交项是 **map 不是单值**，所以并行工具调用时每个 `plan_submit` 与自己的结果配对，不会互相抢。后完成的成功提交覆盖计划并递增 `revision`。
+`client.js` 是手写的客户端 bundle：`window.__ModuleLoader__.load({ id, factory })`，factory 里 `require('react')`。它每 1 秒轮询宿主注册的 `/api/orchestrate.state`，模式开着才挂侧边栏入口与全屏页。
 
-## 自测
+图用 SVG 自绘：按连线分层布局，当前节点呼吸高亮、完成节点打勾、新节点进场动画、光点沿连线流动；`prefers-reduced-motion` 时关掉动画。
+
+## 验证
 
 ```sh
-node selftest.mjs
+node selftest.mjs                     # 纯逻辑与宿主接线，假 ctx
+dsh web --dump-config | grep dsh-method   # 0 条 patch 告警
+dsh web --port 3091                   # 起一遍，验完杀掉
 ```
 
-68 项，覆盖：合法计划接受、结构缺陷拒绝、依赖图缺陷拒绝、验证覆盖缺陷拒绝、元信息缺陷拒绝、边界（超长/`null`/非对象）、判定可观察性的双向误报与漏报、投影折叠（含并发、乱序、状态必须是无损 JSON）、错误路径可诊断、渲染。
-
-## 已知取舍
-
-- **判定靠词表，识别不了的说法会被误拒**：`酒店订好了`、`机票已出票`、`行程已排好` 这类中文口语完成态既不命中产物名词、也不命中状态词，会被拒绝；而同义的 `已完成酒店预订`、`订单已生成` 会通过。同一个意思因为措辞不同而结果不同，这是当前实现的缺陷。[待改] 方向是反过来只检测空话（黑名单），而不是枚举所有合法说法（白名单）。
-- **`.method/` 落在项目根下**：首次落盘时会在 `.method/` 内自写一个内容为 `*` 的 `.gitignore`，让它整目录不进版本控制，不改你的根 `.gitignore`。
-- **同一项目多会话共用一份计划**：路径按工作目录定位，不含 session id，两个并行会话会写同一个 `plan.md`。
-- **没有强制中断**：`plan_submit` 只在 method mode 下可用，但插件不阻止模型不调它就直接干活。真正要强制，得靠 `tools.guard` 拦截写操作——那是另一个量级的设计，当前版本刻意不做，避免变成「不开 method 就不能干活」。
+改 `chart_submit` / `chart_update` 的校验，要双向验：该收的、该拒的各跑一遍。
