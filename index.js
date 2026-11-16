@@ -1,65 +1,120 @@
 /**
- * dsh-method — a general-purpose method for the DeepSeek Harness.
+ * dsh-method —— 子代理编排插件。
  *
- * The mode is logged per-session collaboration state. While it is active, the
- * `method:policy` prompt section carries a domain-neutral planning protocol and
- * the `plan_submit` tool lands a plan whose STRUCTURE is enforced by schema plus
- * validator, not merely requested by prose.
+ * 用户敲 /orchestrate 之后，主对话只做两件事：路由模型与调度。派活走宿主自己的
+ * spawn_teammate（团队子代理缺席时回退 subagent），成员交上来的方案图落成一张选中的图，
+ * 之后主对话只点亮节点。进度写在项目根 .orchestrate/state.json，网页与手机面板读同一份。
  *
- * Enter and leave with `/method` and `/method off`. A bare `/method` only selects
- * the mode and submits no message of its own, so planning starts with whatever
- * the user writes next. State is a fold over the session log (`command/run` +
- * `command/done`, `tool/call` + `tool/result`), so resume, fork, and replay
- * restore it without a plugin-owned event type.
- *
- * Design intent, stated once here because every module depends on it:
- *
- *   The plan this mode produces is not the FASTEST plan, it is the most GENERAL
- *   one. Speed comes from skipping goal restatement, alternatives, constraints,
- *   and verification — which is exactly what makes a plan fail in an unfamiliar
- *   domain. So each of those is mandatory, and each is machine-checked.
+ * 主对话手上的读写工具不拦：它自己调写文件工具时，只回一条警告说明这活该派给成员。
  *
  * @module dsh-method
  */
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-
 import {
 	PROMPT_SECTION_NAME,
-	PLAN_TOOL_NAME,
-	COMMAND_NAME,
+	dispatchPolicy,
 	enteredNotice,
-	methodPolicy,
-	planToolDescription,
-	revisedNotice,
-} from './methodology.js';
+	leftNotice,
+	submitToolDescription,
+	updateToolDescription,
+	writeWarning,
+} from './prompt.js';
 import {
-	PROJECTION_KEY,
-	createMethodProjection,
-	ensureParentDir,
-	resolvePlanPath,
-} from './state.js';
-import { PlanError, renderPlan, validatePlan } from './validate.js';
+	STATUSES,
+	archiveChart,
+	defaultState,
+	flattenChart,
+	readState,
+	resolvePlansDir,
+	resolveStatePath,
+	writeState,
+} from './store.js';
+import {
+	CHART_SUBMIT_SCHEMA,
+	CHART_UPDATE_SCHEMA,
+	ChartError,
+	applyUpdate,
+	assertArgsMatchSchema,
+	validateSubmission,
+} from './schema.js';
 
 export const name = 'method';
 
-/**
- * `sessionProjections` is required: it is the only durable, fork-correct home for
- * the mode. `commands` is optional and read opportunistically, so the plugin
- * still activates in a composition without it (it just has no way in or out).
- */
+/** 宿主服务；commands 与 connection 是可选的，缺了插件照样能跑。 */
 export const inject = ['tools', 'systemPrompt', 'sessionProjections'];
 
-/** Bound on a `notice`-form context summary, mirroring the harness's own. */
-const CONTEXT_SUMMARY_MAX_CHARS = 120;
+/** 编辑器类工具名：主对话自己调这些才算「自己动手改东西」。 */
+const WRITE_TOOLS = new Set(['write', 'edit', 'multi_edit', 'apply_patch', 'create_file', 'str_replace_editor']);
+
+/** 进入与关闭模式的命令名。 */
+const COMMAND_NAME = 'orchestrate';
+
+/** 两个工具的名字。 */
+const SUBMIT_TOOL = 'chart_submit';
+const UPDATE_TOOL = 'chart_update';
+
+/** 会话投影的 key 与版本。 */
+const PROJECTION_KEY = 'orchestrate';
+const PROJECTION_VERSION = 1;
+
+/** 读状态的路由：网页面板轮询它。 */
+const STATE_ROUTE = '/api/orchestrate.state';
+
+/** 折叠出的模式状态里，那条命令带来的选择。 */
+function isPlainObject(value) {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * 模式投影：只认 command/run 与 command/done，不造事件类型。
+ * @returns {object} 投影定义。
+ */
+function createModeProjection() {
+	return {
+		key: PROJECTION_KEY,
+		stateVersion: PROJECTION_VERSION,
+		stateSchema: {
+			parse(value) {
+				if (!isPlainObject(value)) throw new TypeError('orchestrate projection state must be an object');
+				if (typeof value.active !== 'boolean') throw new TypeError('orchestrate projection state.active must be a boolean');
+				const running = value.running;
+				if (running !== undefined && running !== null) {
+					if (!isPlainObject(running) || typeof running.commandId !== 'string' || typeof running.wanted !== 'boolean') {
+						throw new TypeError('orchestrate projection state.running must be { commandId, wanted } or null');
+					}
+				}
+				return {
+					active: value.active,
+					running: running === undefined || running === null ? null : { commandId: running.commandId, wanted: running.wanted },
+				};
+			},
+		},
+		init: () => ({ active: false, running: null }),
+		apply(state, event) {
+			if (!isPlainObject(event) || !isPlainObject(event.data)) return state;
+			const data = event.data;
+			if (event.type === 'command/run') {
+				if (data.name !== COMMAND_NAME) return state;
+				const args = typeof data.args === 'string' ? data.args : '';
+				return { ...state, running: { commandId: String(data.commandId), wanted: args.trim() !== 'off' } };
+			}
+			if (event.type === 'command/done') {
+				const running = state.running;
+				if (running === null || data.commandId !== running.commandId) return state;
+				if (data.kind !== 'success') return { ...state, running: null };
+				return { ...state, active: running.wanted, running: null };
+			}
+			return state;
+		},
+	};
+}
 
 /* ------------------------------------------------------------------ */
-/* Message helpers                                                     */
+/* 消息                                                                */
 /* ------------------------------------------------------------------ */
 
-/** Deep-freeze a freshly built message the way the harness's factories do. */
+/** 冻结一条消息，跟宿主的工厂产出一致。 */
 function deepFreeze(value) {
 	if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
 		Object.freeze(value);
@@ -68,281 +123,34 @@ function deepFreeze(value) {
 	return value;
 }
 
-/**
- * Build one identified, frozen user-role message. Inlined rather than imported so
- * this bundle declares no dependency on a shipped Harness package and keeps
- * resolving from the profile alone.
- * @param {Array<object>} content - content blocks.
- * @param {object} source - message source descriptor.
- * @returns {object} a frozen user message.
- */
-function userMessage(content, source) {
-	return deepFreeze({ id: randomUUID(), role: 'user', content, source });
-}
-
-/**
- * A `notice`-form context message: one line of account, shown without expanding
- * the row.
- * @param {string} text - full text for the model.
- * @param {string} [summary] - collapsed row label.
- * @returns {object} a frozen notice message.
- */
+/** 一条 notice 形式的消息：模型看得见正文，界面折叠成一行。 */
 function noticeMessage(text, summary) {
-	return userMessage([{ type: 'text', text }], {
-		kind: 'method',
-		form: 'notice',
-		summary: String(summary ?? text).replace(/\s+/g, ' ').trim().slice(0, CONTEXT_SUMMARY_MAX_CHARS),
+	return deepFreeze({
+		id: randomUUID(),
+		role: 'user',
+		content: [{ type: 'text', text }],
+		source: { kind: 'method', form: 'notice', summary: String(summary ?? text).replace(/\s+/g, ' ').trim().slice(0, 120) },
 	});
 }
 
 /* ------------------------------------------------------------------ */
-/* Tool argument schema                                                */
+/* 插件                                                                */
 /* ------------------------------------------------------------------ */
 
 /**
- * The JSON Schema for `plan_submit`. It rejects a wrong SHAPE (missing key, wrong
- * type, out-of-enum value) before `execute` runs; the CONTENT rules that JSON
- * Schema cannot express live in `validate.js`.
- *
- * The schema is standard JSON Schema, NOT the `defineTool` DSL: `ctx.tools.register`
- * takes the raw schema straight to the provider, so requiredness is the standard
- * per-object `required: [...]` string array. Putting `required: true` on a
- * property — the DSL form — is rejected by the provider with
- * "Invalid schema for function 'plan_submit': true is not of type 'array'".
- *
- * The schema is intentionally verbose and fully described: the model reads it as
- * the specification of what "a plan" means here.
- * @returns {Record<string, unknown>} the parameter schema.
- */
-function planParameters() {
-	/** A required string property with a description. */
-	const text = (description) => ({ type: 'string', description });
-	/** A required string-enum property. */
-	const choice = (values, description) => ({ type: 'string', enum: values, description });
-	/** A required array-of-strings property. */
-	const texts = (description) => ({ type: 'array', items: { type: 'string' }, description });
-	/** An object property: explicit properties, explicit requiredness, sealed. */
-	const object = (properties, required, description) => ({
-		type: 'object',
-		...(description === undefined ? {} : { description }),
-		properties,
-		required,
-		additionalProperties: false,
-	});
-	return {
-		type: 'object',
-		additionalProperties: false,
-		properties: {
-			plan: object({
-				goal: object(
-					{
-						statement: text('One sentence: the state that will exist when this is done. Be concrete and checkable.'),
-						nonGoals: texts('At least one thing this work will NOT do. Naming these is what keeps scope from creeping.'),
-					},
-					['statement', 'nonGoals'],
-					'What finishing looks like, and what is explicitly out of scope.',
-				),
-				constraints: {
-					type: 'array',
-					description: 'Facts that bound the solution: time, budget, environment, existing decisions that cannot change.',
-					items: object(
-						{
-							text: text('The constraint itself.'),
-							kind: choice(['hard', 'soft'], 'hard = violating it means failure; soft = negotiable.'),
-						},
-						['text', 'kind'],
-					),
-				},
-				alternatives: object(
-					{
-						options: {
-							type: 'array',
-							description: 'At least two distinct approaches.',
-							items: object(
-								{
-									name: text('Short name of the approach.'),
-									pros: text('What this approach is good at.'),
-									cons: text('What it costs or risks. Must be honest — an option with no downside is an unexamined option.'),
-								},
-								['name', 'pros', 'cons'],
-							),
-						},
-						chosen: text('Must exactly match one of the option names.'),
-						reason: text('Why this one wins given the constraints. Reference the constraints, not taste.'),
-					},
-					['options', 'chosen', 'reason'],
-					'At least two approaches considered, and why one was chosen. A single option is a default, not a decision.',
-				),
-				tasks: {
-					type: 'array',
-					description: 'At least two ordered steps. Each must be independently completable and checkable.',
-					items: object(
-						{
-							id: text('Stable lowercase id: [a-z0-9][a-z0-9-]*. Referenced by dependsOn and verification.'),
-							title: text('Short imperative phrase naming the step.'),
-							status: choice(
-								['pending', 'in_progress', 'completed', 'skipped'],
-								'Starting state of this step. Normally pending for every step at submission time.',
-							),
-							dependsOn: texts('Ids of steps that must complete first. Empty array for a starting step. No cycles allowed.'),
-							assumeReasons: texts(
-								'At least one way this step could fail or be blocked. Naming a failure does not cause it; not naming it hides it.',
-							),
-							doneWhen: text(
-								'An OBSERVABLE completion check: a command to run, a file that must exist, a value that must match. Not "it works".',
-							),
-							artifacts: texts('Files, documents, or outputs this step produces. Empty array when the step produces nothing tangible.'),
-						},
-						['id', 'title', 'status', 'dependsOn', 'assumeReasons', 'doneWhen', 'artifacts'],
-					),
-				},
-				verification: {
-					type: 'array',
-					description:
-						'Checks that prove the whole plan worked. Every task must be covered by a check naming it, or by one check with task "*".',
-					items: object(
-						{
-							task: text('A task id from this plan, or "*" for a check covering the whole result.'),
-							check: text('The exact command or inspection to perform.'),
-							expected: text('What the output must be for this to pass. Concrete, not "looks right".'),
-						},
-						['task', 'check', 'expected'],
-					),
-				},
-				reversible: {
-					type: 'boolean',
-					description: 'Can every effect be undone? false means the user must confirm before execution.',
-				},
-				confidence: choice(
-					['high', 'medium', 'low'],
-					'Confidence that this plan achieves the goal given the constraints. Be honest; "medium" is a normal answer.',
-				),
-			}, [
-				'goal',
-				'constraints',
-				'alternatives',
-				'tasks',
-				'verification',
-				'reversible',
-				'confidence',
-			], 'The complete plan. A re-submission replaces the previous plan entirely.'),
-		},
-		required: ['plan'],
-	};
-}
-
-/** The plan parameter schema, built once: `plan_submit`'s registration wants it
- * and the runtime validator wants the same object. */
-const PLAN_SCHEMA = planParameters();
-
-/* ------------------------------------------------------------------ */
-/* Argument validation                                                 */
-/* ------------------------------------------------------------------ */
-
-/**
- * Make `additionalProperties: false` and every other constraint in
- * {@link planParameters} actually bind.
- *
- * `ctx.tools.register` validates only the `output` schema; it forwards
- * `parameters` to the provider as-is and calls `execute` with the raw arguments.
- * Only `defineTool` runs a validator, and that helper takes the DSL form, not the
- * standard JSON Schema this tool declares. So without this step a plan carrying a
- * misspelled key (`typo_field`) is accepted silently: `validatePlan` reads the
- * keys it knows and ignores the rest, and the declared schema is decoration.
- *
- * Resolution is layered because `@deepseek-ai/dsh-tools` is a peer the profile
- * does not link into `node_modules`, so a plain dynamic import from this bundle
- * fails. The dsh CLI ships its own dependencies under
- * `<dsh>/node_modules/@deepseek-ai/dsh-tools`, so the harness entry point on
- * `process.argv[1]` locates it. If nothing resolves, the content validator in
- * `validate.js` still runs: the plugin degrades to "shape not enforced" rather
- * than failing to load.
- */
-let schemaValidatorPromise;
-
-/**
- * Resolve the harness's own JSON Schema validator.
- * @returns {Promise<((schema: object, value: unknown, path: string) => string[]) | null>} the validator, or null.
- */
-function loadSchemaValidator() {
-	if (schemaValidatorPromise !== undefined) return schemaValidatorPromise;
-	schemaValidatorPromise = (async () => {
-		const { dirname, join } = await import('node:path');
-		const { existsSync } = await import('node:fs');
-		const { pathToFileURL } = await import('node:url');
-
-		const candidates = ['@deepseek-ai/dsh-tools'];
-
-		// Walk up from the running harness entry point to the directory that holds
-		// the `@deepseek-ai` scope, then try both the sibling and the nested layout.
-		const entry = typeof process.argv[1] === 'string' ? process.argv[1] : '';
-		if (entry !== '') {
-			let current = dirname(entry);
-			for (;;) {
-				for (const candidate of [
-					join(current, 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'),
-					join(current, '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'),
-				]) {
-					if (existsSync(candidate)) candidates.push(pathToFileURL(candidate).href);
-				}
-				const parent = dirname(current);
-				if (parent === current) break;
-				current = parent;
-			}
-		}
-
-		for (const candidate of candidates) {
-			try {
-				const module = await import(candidate);
-				if (typeof module.validateJsonSchemaValue === 'function') return module.validateJsonSchemaValue;
-			} catch {
-				// Try the next candidate.
-			}
-		}
-		return null;
-	})();
-	return schemaValidatorPromise;
-}
-
-/**
- * Reject arguments that violate the declared parameter schema.
- * @param {object} schema - the tool's JSON Schema.
- * @param {unknown} args - the model-supplied arguments.
- */
-async function assertArgsMatchSchema(schema, args) {
-	const validate = await loadSchemaValidator();
-	if (validate === null) return;
-	const violations = validate(schema, args, '');
-	if (violations.length === 0) return;
-	throw new Error(
-		`计划被拒绝 — arguments do not match the declared schema:\n- ${violations.slice(0, 12).join('\n- ')}`
-		+ (violations.length > 12 ? `\n- …共 ${violations.length} 项` : '')
-		+ '\n字段名必须与 schema 完全一致（拼错的字段不会被读取）；修正后重新提交完整计划。',
-	);
-}
-
-/* ------------------------------------------------------------------ */
-/* Plugin                                                              */
-/* ------------------------------------------------------------------ */
-
-/**
- * Plugin entry.
- * @param {object} ctx - the plugin's Cordis context.
+ * 插件入口。
+ * @param {object} ctx Cordis 上下文。
  */
 export function apply(ctx) {
-	/**
-	 * Revisions already handed out in THIS process, keyed by session.
-	 *
-	 * The projection's `revision` only advances when a `tool/result` folds, which
-	 * happens after `execute` returns. Two concurrent `plan_submit` calls would
-	 * therefore both read the same committed value and label two different plans
-	 * with one revision — and since both write the same file, the second silently
-	 * overwrites the first under a revision number that claims they are the same.
-	 * This counter reserves the next number synchronously, before the await points.
-	 */
-	const reservedRevisions = new WeakMap();
+	/** 最近一次被工具或命令触碰过的项目目录，读状态的路由没带 cwd 时用它。 */
+	let lastProjectDir = process.cwd();
 
-	/** Read this session's method projection state, or `undefined` when unregistered. */
+	/** 已经警告过的「会话 + 回合」，避免同一轮反复刷。 */
+	const warnedTurns = new WeakMap();
+	/** 每个会话当前回合号。 */
+	const currentTurn = new WeakMap();
+
+	/** 读这个会话的模式投影状态。 */
 	function stateOf(session) {
 		try {
 			return ctx.sessionProjections.stateOf(session, PROJECTION_KEY);
@@ -351,70 +159,66 @@ export function apply(ctx) {
 		}
 	}
 
-	/**
-	 * Whether the method is in effect for one session. `command/run` is appended
-	 * BEFORE the handler executes, so a command that is still running has already
-	 * recorded its selection and the pending value wins.
-	 * @param {object} session - the session.
-	 * @returns {boolean} true while the method is active.
-	 */
-	function isMethodActive(session) {
+	/** 模式在这个会话里是否生效（把还在跑的那条命令的选择算进去）。 */
+	function isActive(session) {
 		const state = stateOf(session);
 		if (state === undefined) return false;
 		return state.running === null ? state.active === true : state.running.wanted === true;
 	}
 
-	/**
-	 * Whether the method was already committed to the log, ignoring a selection
-	 * this command is still carrying. A command handler asks this question, not
-	 * {@link isMethodActive}: by the time it runs, its own `command/run` has already
-	 * moved the effective state.
-	 * @param {object} session - the session.
-	 * @returns {boolean} true when the committed state is active.
-	 */
+	/** 已经提交进日志的模式状态，命令处理器问这个。 */
 	function loggedActive(session) {
 		const state = stateOf(session);
 		return state === undefined ? false : state.active === true;
 	}
 
-	/**
-	 * The session's EFFECTIVE working directory.
-	 *
-	 * `session.header.cwd` is only the directory the session was created with; when
-	 * the user runs `/cd` mid-session the harness records a
-	 * `working-directory/change` event and keeps the committed value in the
-	 * `workingDirectory` projection. Reading the header alone would keep writing the
-	 * plan to the directory the session started in, which is wrong after exactly the
-	 * moment the user moved into the project they want to plan.
-	 * @param {object} session - the session.
-	 * @returns {string} an absolute directory.
-	 */
+	/** 会话当前的工作目录（/cd 之后以投影为准）。 */
 	function sessionCwd(session) {
 		try {
 			const projected = ctx.sessionProjections.stateOf(session, 'workingDirectory');
 			if (typeof projected === 'string' && projected !== '') return projected;
 		} catch {
-			// No working-directory service in this composition; fall back to the header.
+			// 没有工作目录服务就退回会话头。
 		}
 		try {
 			const cwd = session.header?.cwd;
 			if (typeof cwd === 'string' && cwd !== '') return cwd;
 		} catch {
-			// A session without readable metadata uses the process directory.
+			// 会话头读不到就用进程目录。
 		}
 		return process.cwd();
 	}
 
-	/** Absolute plan path for one session. */
-	function planPathFor(session) {
-		return resolvePlanPath(sessionCwd(session));
+	/** 团队子代理工具在不在。 */
+	function hasTeamTools(agent) {
+		try {
+			return ctx.tools.get('spawn_teammate', agent) !== undefined;
+		} catch {
+			return false;
+		}
 	}
 
-	/* ---------------- durable state ---------------- */
+	/** 读状态前把项目目录记下来（读状态的路由要用）。 */
+	function track(cwd) {
+		lastProjectDir = cwd;
+		return cwd;
+	}
 
-	ctx.sessionProjections.register(createMethodProjection(COMMAND_NAME, PLAN_TOOL_NAME));
+	/** 把 enabled 写进状态文件；写失败不打断命令。 */
+	function setEnabled(cwd, enabled) {
+		try {
+			const { state } = readState(cwd);
+			writeState(cwd, { ...state, enabled });
+		} catch {
+			// 状态目录不可写时，面板看不到，但模式本身照常开。
+		}
+	}
 
-	/* ---------------- prompt ---------------- */
+	/* ---------------- 模式状态 ---------------- */
+
+	ctx.sessionProjections.register(createModeProjection());
+
+	/* ---------------- 提示词 ---------------- */
 
 	ctx.systemPrompt.section({
 		name: PROMPT_SECTION_NAME,
@@ -423,145 +227,258 @@ export function apply(ctx) {
 			try {
 				const agent = context.agent;
 				if (agent === undefined) return '';
-				if (!isMethodActive(agent.session)) return '';
-				return methodPolicy(planPathFor(agent.session));
+				const session = agent.session;
+				if (!isActive(session)) return '';
+				const cwd = track(sessionCwd(session));
+				return dispatchPolicy({
+					hasTeam: hasTeamTools(agent),
+					plansDir: resolvePlansDir(cwd),
+					statePath: resolveStatePath(cwd),
+				});
 			} catch {
-				// A provider that throws would break assembly; contribute nothing instead.
+				// 提供者抛异常会让整次装配失败，只能贡献空串。
 				return '';
 			}
 		},
 	});
 
-	/* ---------------- /method ---------------- */
+	/* ---------------- 自己动手时的警告 ---------------- */
+
+	ctx.on('session/event', (session, event) => {
+		if (event.type === 'turn/start') currentTurn.set(session, event.data.turn);
+	});
+
+	/**
+	 * 主对话在模式里调写文件工具：回一条警告，不拦。
+	 * @param {object} agent 调用方。
+	 * @param {string} toolName 工具名。
+	 */
+	function warnSelfEdit(agent, toolName) {
+		if (agent === undefined) return;
+		const session = agent.session;
+		// 子代理的会话模式是关的，天然收不到这条警告。
+		if (!isActive(session)) return;
+		const turn = currentTurn.get(session) ?? 0;
+		if (warnedTurns.get(session) === turn) return;
+		warnedTurns.set(session, turn);
+		try {
+			agent.inject(noticeMessage(writeWarning(toolName), '提示：这活该派给成员'));
+		} catch {
+			// 注入不进去不影响这次调用。
+		}
+	}
+
+	ctx.on('tools/pre-execute', async (exec, next) => {
+		if (WRITE_TOOLS.has(exec.name)) warnSelfEdit(exec.agent, exec.name);
+		return next();
+	});
+
+	/* ---------------- /orchestrate ---------------- */
 
 	ctx.inject(['commands'], (commandCtx) => {
 		commandCtx.commands.register({
 			definitionId: 'dsh-method',
 			name: COMMAND_NAME,
-			description: 'Method mode: 通用做事方法 — 任何非平凡任务先产出结构化执行计划（目标与非目标 / 约束 / 方案比较 / 可观察完成判定 / 覆盖式验证），结构由 schema 与校验器强制，再逐步执行',
+			description: '编排模式：主对话只做路由与调度，活派给子代理；成员交方案流程图，主对话选中并点亮进度，网页与手机面板看得到',
 			input: { hint: '[off]', attachments: false },
 			handler: ({ agent, rawInput }) => {
 				const session = agent.session;
 				const message = rawInput.trim();
+				const cwd = track(sessionCwd(session));
 
 				if (message === 'off') {
-					if (!loggedActive(session)) return { kind: 'success', text: 'Method mode 未开启。' };
-					agent.inject(noticeMessage('用户关闭了 method mode。已提交的计划仍留在 .method/plan.md，但不再强制。', 'Method mode off'));
-					return { kind: 'success', text: 'Method mode off.' };
+					if (!loggedActive(session)) return { kind: 'success', text: '编排模式没开着。' };
+					setEnabled(cwd, false);
+					agent.inject(noticeMessage(leftNotice(), '编排模式已关闭'));
+					return { kind: 'success', text: '编排模式已关闭。' };
 				}
 
-				// One collaboration mode at a time: plan mode owns the session while it is on.
-				if (!loggedActive(session)) {
-					const planMode = ctx.get('planMode');
-					if (planMode !== undefined) {
-						let planActive = false;
-						try {
-							planActive = planMode.get(agent)?.active === true;
-						} catch {
-							planActive = false;
-						}
-						if (planActive) return { kind: 'error', text: 'Exit plan mode first.' };
-					}
-				}
-
-				// A bare `/method` is a silent mode toggle: it submits nothing, so the
-				// protocol section is already in effect for the next turn.
+				const team = hasTeamTools(agent);
+				setEnabled(cwd, true);
+				// 无参开启不合成消息：提示词段在下一轮装配里自然生效。
 				if (message === '') {
-					agent.inject(noticeMessage(enteredNotice(), 'Method mode on'));
-					return { kind: 'success', text: 'Method mode on. 直接说要做的事，我先产出结构化计划。' };
+					agent.inject(noticeMessage(enteredNotice(team), '编排模式已开启'));
+					return { kind: 'success', text: enteredNotice(team) };
 				}
-				agent.steer(userMessage([{ type: 'text', text: message }], { kind: 'user' }));
-				return { kind: 'success', text: 'Method mode on.' };
+				agent.steer(deepFreeze({
+					id: randomUUID(),
+					role: 'user',
+					content: [{ type: 'text', text: message }],
+					source: { kind: 'user' },
+				}));
+				return { kind: 'success', text: '编排模式已开启。' };
 			},
 		});
 	});
 
-	/* ---------------- plan_submit ---------------- */
+	/* ---------------- chart_submit ---------------- */
 
 	ctx.tools.register({
-		name: PLAN_TOOL_NAME,
-		description: planToolDescription(),
-		parameters: PLAN_SCHEMA,
+		name: SUBMIT_TOOL,
+		description: submitToolDescription(),
+		parameters: CHART_SUBMIT_SCHEMA,
 		output: {
 			schema: {
 				type: 'object',
 				additionalProperties: false,
 				properties: {
 					accepted: { type: 'boolean', const: true },
-					revision: { type: 'integer' },
-					planPath: { type: 'string' },
-					taskCount: { type: 'integer' },
-					rendered: { type: 'string' },
+					chartId: { type: 'string' },
+					name: { type: 'string' },
+					nodeCount: { type: 'integer' },
+					edgeCount: { type: 'integer' },
+					plansDir: { type: 'string' },
 				},
-				required: ['accepted', 'revision', 'planPath', 'taskCount', 'rendered'],
+				required: ['accepted', 'chartId', 'name', 'nodeCount', 'edgeCount', 'plansDir'],
 			},
-			render: (_args, value) => [
-				{
-					type: 'text',
-					text:
-						`计划已接受（revision ${value.revision}，${value.taskCount} 个任务），已落盘：${value.planPath}\n\n`
-						+ '现在按下列计划执行。每步完成后立刻用该步的「完成判定」验证；不通过就停下报告。\n\n'
-						+ value.rendered,
-				},
-			],
+			render: (_args, value) => [{
+				type: 'text',
+				text: `方案「${value.name}」已收下（${value.chartId}，${value.nodeCount} 个节点、${value.edgeCount} 条连线），存档在 ${value.plansDir}。等主对话比较后选中。`,
+			}],
 		},
 		async execute(args, exec) {
-			await assertArgsMatchSchema(PLAN_SCHEMA, args);
+			await assertArgsMatchSchema(CHART_SUBMIT_SCHEMA, args);
 			const agent = exec.agent;
-			if (agent === undefined) {
-				throw new Error(`${PLAN_TOOL_NAME} 需要一个调用它的 agent（没有会话可以落盘）`);
-			}
+			if (agent === undefined) throw new Error(`${SUBMIT_TOOL} 需要调用它的 agent`);
 			const session = agent.session;
-			if (!isMethodActive(session)) {
-				throw new Error(`${PLAN_TOOL_NAME} 只能在 method mode 中调用；先运行 /method 开启。`);
-			}
+			if (!isActive(session)) throw new Error(`${SUBMIT_TOOL} 只能在编排模式里用；先让用户敲 /orchestrate。`);
 
-			let plan;
+			let chart;
 			try {
-				plan = validatePlan(args);
+				chart = validateSubmission(args);
 			} catch (error) {
-				if (error instanceof PlanError) {
-					// The message is the repair instruction: it names the path and the rule.
-					throw new Error(`计划被拒绝 — ${error.message}\n修正该字段后重新提交完整计划。`);
-				}
+				if (error instanceof ChartError) throw new Error(`方案被拒：${error.message}。改完重交。`);
 				throw error;
 			}
 
-			const state = stateOf(session);
-			// Reserve a revision monotonically within this process so concurrent calls
-			// cannot share one number. The committed projection revision is the floor,
-			// because a resumed session may already be ahead of this process's counter.
-			const committed = state?.revision ?? 0;
-			const reserved = Math.max(committed, reservedRevisions.get(session) ?? 0) + 1;
-			reservedRevisions.set(session, reserved);
-			const revision = reserved;
-			const planPath = planPathFor(session);
-			const rendered = renderPlan(plan, revision);
-
+			const cwd = track(sessionCwd(session));
+			const { state } = readState(cwd);
+			const nodes = { ...state.nodes };
+			for (const node of chart.nodes) {
+				if (!Object.hasOwn(nodes, node.id)) nodes[node.id] = { title: node.title, status: STATUSES[0] };
+			}
+			const next = {
+				...state,
+				enabled: true,
+				nodes,
+				charts: { ...state.charts, [chart.id]: chart },
+			};
 			try {
-				ensureParentDir(planPath);
-				writeFileSync(planPath, `${rendered}\n`, 'utf8');
-				// The plan lives inside the user's project. Writing a self-ignoring
-				// `.gitignore` next to it keeps `git status` clean without touching the
-				// project's own `.gitignore` — an edit the user never asked for and would
-				// have to review.
-				const ignorePath = join(dirname(planPath), '.gitignore');
-				if (!existsSync(ignorePath)) writeFileSync(ignorePath, '*\n', 'utf8');
+				archiveChart(cwd, chart);
+				writeState(cwd, next);
 			} catch (error) {
-				throw new Error(`计划校验通过但落盘失败（${planPath}）：${error?.message ?? error}`);
+				throw new Error(`方案通过校验但落盘失败（${resolvePlansDir(cwd)}）：${error?.message ?? error}`);
 			}
-
-			if (revision > 1) {
-				agent.inject(noticeMessage(revisedNotice(revision), `Method: revision ${revision}`));
-			}
-
 			return {
 				accepted: true,
-				revision,
-				planPath,
-				taskCount: plan.tasks.length,
-				rendered,
+				chartId: chart.id,
+				name: chart.name,
+				nodeCount: chart.nodes.length,
+				edgeCount: chart.edges.length,
+				plansDir: resolvePlansDir(cwd),
 			};
 		},
 	});
+
+	/* ---------------- chart_update ---------------- */
+
+	ctx.tools.register({
+		name: UPDATE_TOOL,
+		description: updateToolDescription(),
+		parameters: CHART_UPDATE_SCHEMA,
+		output: {
+			schema: {
+				type: 'object',
+				additionalProperties: false,
+				properties: {
+					updated: { type: 'boolean', const: true },
+					revision: { type: 'integer' },
+					selectedChart: { type: 'string' },
+					stage: { type: 'string' },
+					next: { type: 'string' },
+					memberCount: { type: 'integer' },
+					nodeCount: { type: 'integer' },
+					statePath: { type: 'string' },
+				},
+				required: ['updated', 'revision', 'selectedChart', 'stage', 'next', 'memberCount', 'nodeCount', 'statePath'],
+			},
+			render: (_args, value) => {
+				const flat = value.nodeCount === 0 ? '还没有选中图' : `${value.nodeCount} 个节点`;
+				return [{
+					type: 'text',
+					text: `进度已更新（revision ${value.revision}）：选中图 ${value.selectedChart === '' ? '无' : value.selectedChart}，${flat}，${value.memberCount} 名成员。阶段：${value.stage === '' ? '未写' : value.stage}；下一步：${value.next === '' ? '未写' : value.next}。`,
+				}];
+			},
+		},
+		async execute(args, exec) {
+			await assertArgsMatchSchema(CHART_UPDATE_SCHEMA, args);
+			const agent = exec.agent;
+			if (agent === undefined) throw new Error(`${UPDATE_TOOL} 需要调用它的 agent`);
+			const session = agent.session;
+			if (!isActive(session)) throw new Error(`${UPDATE_TOOL} 只能在编排模式里用；先敲 /orchestrate。`);
+
+			const cwd = track(sessionCwd(session));
+			const { state } = readState(cwd);
+			let updated;
+			try {
+				updated = applyUpdate(args, state);
+			} catch (error) {
+				if (error instanceof ChartError) throw new Error(`更新被拒：${error.message}`);
+				throw error;
+			}
+
+			let written;
+			try {
+				written = writeState(cwd, { ...updated.state, enabled: true });
+			} catch (error) {
+				throw new Error(`更新通过校验但落盘失败（${resolveStatePath(cwd)}）：${error?.message ?? error}`);
+			}
+
+			const flat = flattenChart(written.state);
+			return {
+				updated: true,
+				revision: written.state.revision,
+				selectedChart: written.state.selectedChart ?? '',
+				stage: written.state.stage,
+				next: written.state.next,
+				memberCount: written.state.members.length,
+				nodeCount: flat.nodes.length,
+				statePath: written.path,
+			};
+		},
+	});
+
+	/* ---------------- 面板读状态的路由 ---------------- */
+
+	ctx.inject(['connection'], (routeCtx) => {
+		routeCtx.connection.fetch.register({
+			path: STATE_ROUTE,
+			methods: ['GET'],
+			requestBody: 'buffered',
+			fetch: async (request) => {
+				const url = new URL(request.url, 'http://localhost');
+				const asked = url.searchParams.get('cwd');
+				const cwd = asked !== null && asked !== '' ? asked : lastProjectDir;
+				const { state, broken, path } = readState(cwd);
+				const body = {
+					cwd,
+					statePath: path,
+					broken,
+					enabled: state.enabled,
+					selectedChart: state.selectedChart,
+					stage: state.stage,
+					next: state.next,
+					members: state.members,
+					charts: Object.values(state.charts).map((chart) => ({ id: chart.id, name: chart.name })),
+					revision: state.revision,
+					updatedAt: state.updatedAt,
+					...flattenChart(state),
+				};
+				return Response.json(body, { headers: { 'cache-control': 'no-store' } });
+			},
+		});
+	});
 }
+
+/** 导出给自测用的常量。 */
+export const internals = { COMMAND_NAME, SUBMIT_TOOL, UPDATE_TOOL, PROJECTION_KEY, STATE_ROUTE, createModeProjection, defaultState };

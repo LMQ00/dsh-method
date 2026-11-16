@@ -1,8 +1,8 @@
 {
   "name": "dsh-method",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "General-purpose method for the DeepSeek Harness: a domain-neutral planning protocol whose plan structure is enforced by schema and validator, not just requested by prose.",
+  "description": "Subagent orchestration for the DeepSeek Harness: the main conversation routes models and dispatches work; members submit plan flowcharts, the conversation picks one and lights up progress, and both the web and phone panels read the same .orchestrate/state.json.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -13,24 +13,29 @@
     "dsh-plugin",
     "deepseek-harness",
     "cordis",
-    "method",
-    "planning"
+    "orchestration",
+    "subagent"
   ],
   "exports": {
     ".": "./index.js",
+    "./store": "./store.js",
+    "./schema": "./schema.js",
+    "./prompt": "./prompt.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
-    "state.js",
-    "validate.js",
-    "methodology.js",
+    "store.js",
+    "schema.js",
+    "prompt.js",
     "cordis.patch.yml",
     "selftest.mjs",
     "README.md",
-    "LICENSE",
-    "docs/*.md"
+    "LICENSE"
   ],
+  "scripts": {
+    "test": "node selftest.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
