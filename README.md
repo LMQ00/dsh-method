@@ -16,7 +16,7 @@ dsh plugin --profile web add /path/to/dsh-method
 | --- | --- |
 | 开启 | `/orchestrate`，后面可以跟这次要做的事 |
 | 关闭 | `/orchestrate off`。提示词段撤下、面板入口隐藏，进度留在盘上 |
-| 看进度 | 网页侧边栏的「编排」图标；手机 App 对话详情页「插件」页签的「编排」面板 |
+| 看进度 | 网页会话头部的「编排」图标，点开是右侧栏的编排标签页；手机 App 对话详情页「插件」页签的「编排」面板 |
 
 主对话派活走宿主自己的 `spawn_teammate`；团队子代理没开时回退到 `subagent`，由主对话中转。派谁、派几个、要不要审查，都不写死。
 
@@ -67,7 +67,11 @@ dsh plugin --profile web add /path/to/dsh-method
 
 ## 网页面板
 
-`client.js` 是手写的客户端 bundle：`window.__ModuleLoader__.load({ id, factory })`，factory 里 `require('react')`。它每 1 秒轮询宿主注册的 `/api/orchestrate.state`，模式开着才挂侧边栏入口与全屏页。
+`client.js` 是手写的客户端 bundle：`window.__ModuleLoader__.load({ id, factory })`，factory 里 `require('react')`。
+
+它按会话所在的项目目录问状态：先读会话的工作目录投影，退到会话清单里的 cwd，带 `?cwd=` 请求 `/api/orchestrate.state`。每个项目一条轮询，没人看就停。
+
+图标进的是 `conversation.session.header.utilities`，只在这个项目开着编排时出现；点开的是右侧栏标签页（`sidebar.right.pane.tab`，kind `orchestrate`），按钮再点一次收起。
 
 图用 SVG 自绘：按连线分层布局，当前节点呼吸高亮、完成节点打勾、新节点进场动画、光点沿连线流动；`prefers-reduced-motion` 时关掉动画。
 

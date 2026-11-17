@@ -6,8 +6,12 @@ window.__ModuleLoader__.load({
 		const react = require("react");
 		const h = react.createElement;
 
-		/** 面板注册用的 id：sidebar 入口与全屏页共用。 */
-		const PANEL_ID = "orchestrate";
+		/** 右侧栏标签页的注册 id，也是标签体在槽位里的 key。 */
+		const TAB_ID = "dsh-method";
+		/** 标签页类型，`openTab` 按它找。 */
+		const TAB_KIND = "orchestrate";
+		/** 会话头部按钮的注册 id。 */
+		const HEADER_ID = "orchestrate";
 		/** 状态来源：轮询宿主注册的路由。 */
 		const STATE_ROUTE = "api/orchestrate.state";
 		/** 轮询间隔。 */
@@ -27,18 +31,53 @@ window.__ModuleLoader__.load({
 
 		/* ---------------- 数据 ---------------- */
 
+		/** 插件的客户端上下文，定义会话目录怎么问。 */
+		let clientCtx = null;
+
 		/**
-		 * 一份状态来源：轮询路由，把结果广播给订阅者。
+		 * 会话所在的项目目录：先问工作目录投影，再问会话清单里的 cwd。
+		 * @param {string} sessionId 会话。
+		 * @returns {string} 绝对路径；问不到就是空串。
+		 */
+		function projectDirOf(sessionId) {
+			if (clientCtx === null || typeof sessionId !== "string" || sessionId === "") return "";
+			try {
+				const projected = clientCtx.sessions.binding(sessionId)?.session.projections.faceOf("workingDirectory").getSnapshot();
+				if (typeof projected === "string" && projected !== "") return projected;
+			} catch {
+				// 没有绑定就没有投影，退到会话清单。
+			}
+			try {
+				const listed = clientCtx.sessions.list.getSnapshot().byId[sessionId]?.cwd;
+				if (typeof listed === "string" && listed !== "") return listed;
+			} catch {
+				// 清单里也没有就当问不到。
+			}
+			return "";
+		}
+
+		/**
+		 * 一个项目的状态来源：轮询路由，把结果广播给订阅者；没人订阅就停。
+		 * @param {string} cwd 项目目录；空串时不该建来源。
 		 * @returns {object} 订阅接口。
 		 */
-		function createSource() {
+		function createSource(cwd) {
 			let snapshot = { loading: true, error: null, data: null };
 			const listeners = new Set();
 			let timer = null;
 			let inflight = false;
 
-			/** 发布新快照。 */
+			/** 发布新快照；内容没变就不吵订阅者。 */
 			function publish(next) {
+				const previous = snapshot;
+				if (next.error === previous.error && next.loading === previous.loading) {
+					const before = previous.data;
+					const after = next.data;
+					if (before === after) return;
+					if (before !== null && after !== null
+						&& before.revision === after.revision && before.updatedAt === after.updatedAt
+						&& before.enabled === after.enabled && before.stage === after.stage && before.next === after.next) return;
+				}
 				snapshot = next;
 				for (const listener of listeners) listener();
 			}
@@ -48,7 +87,9 @@ window.__ModuleLoader__.load({
 				if (inflight) return;
 				inflight = true;
 				try {
-					const response = await fetch(STATE_ROUTE, { headers: { accept: "application/json" }, credentials: "same-origin" });
+					if (cwd === "") throw new Error("没拿到这个会话的项目目录");
+					const url = STATE_ROUTE + "?cwd=" + encodeURIComponent(cwd);
+					const response = await fetch(url, { headers: { accept: "application/json" }, credentials: "same-origin" });
 					if (!response.ok) throw new Error("HTTP " + response.status);
 					const data = await response.json();
 					publish({ loading: false, error: null, data });
@@ -59,34 +100,69 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			/** 开始轮询。 */
+			function start() {
+				if (timer !== null) return;
+				void refresh();
+				timer = setInterval(() => void refresh(), POLL_MS);
+			}
+
+			/** 停止轮询。 */
+			function stop() {
+				if (timer === null) return;
+				clearInterval(timer);
+				timer = null;
+			}
+
 			return {
 				getSnapshot: () => snapshot,
 				subscribe(listener) {
 					listeners.add(listener);
-					return () => listeners.delete(listener);
-				},
-				start() {
-					if (timer !== null) return;
-					void refresh();
-					timer = setInterval(() => void refresh(), POLL_MS);
-				},
-				stop() {
-					if (timer === null) return;
-					clearInterval(timer);
-					timer = null;
+					if (listeners.size === 1) start();
+					return () => {
+						listeners.delete(listener);
+						if (listeners.size === 0) stop();
+					};
 				},
 			};
 		}
 
-		/** 全局唯一的状态来源。 */
-		const source = createSource();
+		/** 每个项目一条来源，键是项目目录。 */
+		const sources = new Map();
 
 		/**
-		 * 订阅状态来源。
+		 * 取一个项目的状态来源。
+		 * @param {string} cwd 项目目录。
+		 * @returns {object} 状态来源。
+		 */
+		function sourceOf(cwd) {
+			let source = sources.get(cwd);
+			if (source === undefined) {
+				source = createSource(cwd);
+				sources.set(cwd, source);
+			}
+			return source;
+		}
+
+		/** 问不到目录时的空订阅：什么都不轮询。 */
+		const NO_SUBSCRIPTION = () => () => {};
+		/** 问不到目录时的快照。 */
+		const NO_PROJECT = { loading: false, error: "没拿到这个会话的项目目录", data: null };
+		const noProjectSnapshot = () => NO_PROJECT;
+
+		/**
+		 * 订阅某个会话所在项目的状态；问不到目录就不订阅，也不起轮询。
+		 * @param {string} sessionId 会话。
 		 * @returns {object} 当前快照。
 		 */
-		function useSnapshot() {
-			return react.useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot);
+		function useSnapshot(sessionId) {
+			const cwd = projectDirOf(sessionId);
+			const source = cwd === "" ? null : sourceOf(cwd);
+			return react.useSyncExternalStore(
+				source === null ? NO_SUBSCRIPTION : source.subscribe,
+				source === null ? noProjectSnapshot : source.getSnapshot,
+				source === null ? noProjectSnapshot : source.getSnapshot,
+			);
 		}
 
 		/* ---------------- 布局 ---------------- */
@@ -181,6 +257,9 @@ window.__ModuleLoader__.load({
 				".dsh-orch-node[data-status='进行中']{animation:dsh-orch-breathe 2.6s ease-in-out infinite}",
 				".dsh-orch-node[data-fresh='true']{animation:dsh-orch-enter 420ms ease-out both}",
 				".dsh-orch-check{animation:dsh-orch-check 380ms ease-out both;transform-origin:center}",
+				".dsh-orch-head{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:0;border-radius:7px;background:transparent;color:inherit;cursor:pointer;opacity:0.75}",
+				".dsh-orch-head:hover{opacity:1;background:var(--dsw-alias-bg-l2,rgba(127,127,127,0.16))}",
+				".dsh-orch-head:focus-visible{outline:2px solid var(--dsw-alias-brand,#6ea5ff);outline-offset:2px}",
 				"@media (prefers-reduced-motion: reduce){.dsh-orch-node[data-status='进行中']{animation:none}.dsh-orch-node[data-fresh='true']{animation:none}.dsh-orch-check{animation:none}.dsh-orch-dot{display:none}}",
 			].join("\n");
 			document.head.appendChild(style);
@@ -329,22 +408,23 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 全屏面板：阶段、流程图、下一步、成员。
-		 * @returns {object} 页面元素。
+		 * 标签页内容：阶段、流程图、下一步、成员。
+		 * @param {object} props {sessionId}。
+		 * @returns {object} 面板元素。
 		 */
-		function ChartPage() {
-			const snapshot = useSnapshot();
+		function ChartPage(props) {
+			const snapshot = useSnapshot(props.sessionId);
 			const data = snapshot.data;
-			const shell = { padding: "24px 28px", maxWidth: 1200, margin: "0 auto", display: "flex", flexDirection: "column", gap: 16, fontFamily: "inherit" };
+			const shell = { padding: "16px 18px", display: "flex", flexDirection: "column", gap: 14, fontFamily: "inherit" };
 
 			if (data === null) {
-				return h("div", { style: shell }, h("div", { style: { fontSize: 14, opacity: 0.75 } },
+				return h("div", { style: shell }, h("div", { style: { fontSize: 13, opacity: 0.75 } },
 					snapshot.error === null ? "正在读取编排状态…" : "读不到状态：" + snapshot.error));
 			}
 			if (!data.enabled) {
 				return h("div", { style: shell }, [
-					h("div", { key: "title", style: { fontSize: 20, fontWeight: 600 } }, "编排"),
-					h("div", { key: "hint", style: { fontSize: 14, opacity: 0.75 } }, "还没开启编排。在对话里敲 /orchestrate 开启。"),
+					h("div", { key: "title", style: { fontSize: 15, fontWeight: 600 } }, "还没开启编排"),
+					h("div", { key: "hint", style: { fontSize: 13, opacity: 0.75 } }, "在对话里敲 /orchestrate 开启。"),
 				]);
 			}
 
@@ -354,13 +434,12 @@ window.__ModuleLoader__.load({
 			const done = nodes.filter((node) => node.status === "完成").length;
 
 			return h("div", { style: shell }, [
-				h("div", { key: "head", style: { display: "flex", alignItems: "baseline", gap: 12 } }, [
-					h("div", { key: "title", style: { fontSize: 20, fontWeight: 600 } }, "编排"),
-					h("div", { key: "stage", style: { fontSize: 14, opacity: 0.8 } }, data.stage === "" ? "未写阶段" : data.stage),
-					h("div", { key: "count", style: { marginLeft: "auto", fontSize: 13, opacity: 0.6 } },
+				h("div", { key: "head", style: { display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" } }, [
+					h("div", { key: "stage", style: { fontSize: 15, fontWeight: 600 } }, data.stage === "" ? "未写阶段" : data.stage),
+					h("div", { key: "count", style: { marginLeft: "auto", fontSize: 12, opacity: 0.6 } },
 						nodes.length === 0 ? "还没有选中图" : done + "/" + nodes.length + " 节点完成"),
 				]),
-				h("div", { key: "chart", style: { background: "var(--dsw-specific-sidebar-fill, rgba(255,255,255,0.03))", borderRadius: 14, padding: 16, border: "0.5px solid var(--dsw-alias-border-l3, rgba(255,255,255,0.12))" } },
+				h("div", { key: "chart", style: { background: "var(--dsw-specific-sidebar-fill, rgba(255,255,255,0.03))", borderRadius: 12, padding: 12, border: "0.5px solid var(--dsw-alias-border-l3, rgba(255,255,255,0.12))", overflowX: "auto" } },
 					nodes.length === 0
 						? h("div", { style: { fontSize: 13, opacity: 0.7 } }, "成员还没交方案图，或者还没选中一张。")
 						: h(Chart, { nodes: nodes, edges: edges })),
@@ -377,8 +456,8 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 侧边栏入口图标。
-		 * @param {object} props {size, active}。
+		 * 编排图标：三个节点连着线。
+		 * @param {object} props {size}。
 		 * @returns {object} svg 元素。
 		 */
 		function OrchestrateGlyph(props) {
@@ -403,60 +482,73 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
+		/**
+		 * 会话头部的编排按钮，点一下开关本会话的编排标签页。项目没开编排就不画。
+		 * @param {object} props {sessionId, toggle}。
+		 * @returns {object} 按钮元素。
+		 */
+		function HeaderButton(props) {
+			const snapshot = useSnapshot(props.sessionId);
+			const data = snapshot.data;
+			if (data === null || data.enabled !== true) return null;
+			return h("button", {
+				type: "button",
+				className: "dsh-orch-head",
+				title: "编排",
+				"aria-label": "编排",
+				onClick: () => { props.toggle(); },
+			}, h(OrchestrateGlyph, { size: 16 }));
+		}
+
 		/* ---------------- 注册 ---------------- */
 
 		/**
-		 * 插件入口：轮询状态，模式开着才挂入口。
+		 * 插件入口：挂右侧栏标签页与会话头部按钮。按钮自己按项目状态决定画不画。
 		 * @param {object} ctx 客户端 Cordis 上下文。
 		 */
 		function apply(ctx) {
+			clientCtx = ctx;
 			injectStyle();
-			ctx.effect(() => {
-				let mainHandle = null;
-				let entryHandle = null;
 
-				/** 按当前 enabled 增删两个注册。 */
-				function sync() {
-					const snapshot = source.getSnapshot();
-					const on = snapshot.data !== null && snapshot.data.enabled === true;
-					if (on && mainHandle === null) {
-						try {
-							mainHandle = ctx.slots.inject("main", () => ctx.slots.register({ name: "main", key: PANEL_ID }, ChartPage));
-							entryHandle = ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
-								name: "sidebar.panellist",
-								id: PANEL_ID,
-								order: 20,
-								label: () => "编排",
-							}, OrchestrateGlyph));
-						} catch (error) {
-							mainHandle = null;
-							entryHandle = null;
-						}
-					} else if (!on) {
-						for (const handle of [mainHandle, entryHandle]) {
-							if (typeof handle === "function") handle();
-						}
-						mainHandle = null;
-						entryHandle = null;
-					}
+			/**
+			 * 头部按钮的行为：本会话的编排页开着就收起，否则打开并聚焦。
+			 * @param {string} sessionId 当前会话。
+			 */
+			function togglePanel(sessionId) {
+				const right = ctx.sidebarRight;
+				// 右侧栏的 openTab / hide 都作用在屏上的会话；点的不是它就别动。
+				if (right.mounted.getSnapshot() !== sessionId) return;
+				const tab = right.tabsIn(sessionId).find((item) => item.kind === TAB_KIND);
+				const active = right.active();
+				if (tab !== undefined && right.isExpanded() && active !== undefined && active.kind === TAB_KIND) {
+					right.hide(tab.id);
+					return;
 				}
+				right.openTab(TAB_KIND);
+			}
 
-				const unsubscribe = source.subscribe(sync);
-				source.start();
-				sync();
-				return () => {
-					unsubscribe();
-					source.stop();
-					for (const handle of [mainHandle, entryHandle]) {
-						if (typeof handle === "function") handle();
-					}
-				};
-			});
+			ctx.effect(() => ctx.sidebarRightTabs.register({
+				id: TAB_ID,
+				kind: TAB_KIND,
+				title: () => "编排",
+			}), "dsh-method: 右侧栏标签页");
+
+			ctx.slots.inject("sidebar.right.pane.tab", () => ctx.slots.register({
+				name: "sidebar.right.pane.tab",
+				key: TAB_ID,
+			}, ChartPage));
+
+			ctx.slots.inject("conversation.session.header.utilities", () => ctx.slots.register({
+				name: "conversation.session.header.utilities",
+				id: HEADER_ID,
+				order: -6,
+				inject: (sessionId) => ({ toggle: () => { togglePanel(sessionId); } }),
+			}, HeaderButton));
 		}
 
 		exports.ChartPage = ChartPage;
 		exports.apply = apply;
-		exports.inject = ["slots"];
+		exports.inject = ["slots", "sidebarRightTabs", "sidebarRight", "sessions"];
 		return module.exports;
 	},
 });

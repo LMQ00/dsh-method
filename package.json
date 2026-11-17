@@ -1,6 +1,6 @@
 {
   "name": "dsh-method",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Subagent orchestration for the DeepSeek Harness: the main conversation routes models and dispatches work; members submit plan flowcharts, the conversation picks one and lights up progress, and both the web and phone panels read the same orchestration state.",
   "license": "MIT",
