@@ -440,6 +440,37 @@ await (async () => {
 })();
 
 
+
+check('团队工具缺席与在场给不同回执', () => {
+	const dir = makeProject('team');
+	const idle = makeContext();
+	plugin.apply(idle.ctx);
+	const session = makeSession(dir, { active: false, running: null });
+	const agent = { session, injected: [], inject: (message) => agent.injected.push(message), steer: () => {} };
+	const offText = idle.commands[0].handler({ agent, rawInput: '' }).text;
+	if (!offText.includes('回退')) throw new Error('缺席时回执没说回退：' + offText);
+
+	const team = makeContext();
+	team.ctx.tools.register({ name: 'spawn_teammate', description: 'stub', parameters: { type: 'object' }, execute: async () => ({}) });
+	plugin.apply(team.ctx);
+	const teamAgent = { session, injected: [], inject: (message) => teamAgent.injected.push(message), steer: () => {} };
+	const onText = team.commands[0].handler({ agent: teamAgent, rawInput: '' }).text;
+	if (onText.includes('回退')) throw new Error('团队在场时不该说回退：' + onText);
+	if (!onText.includes('成员之间可以直接对话')) throw new Error('团队在场时没说明成员能直接对话：' + onText);
+	rmSync(dir, { recursive: true, force: true });
+});
+
+check('同一项目的两个会话共用一份状态', () => {
+	const dir = makeProject('shared');
+	const nested = join(dir, 'sub');
+	mkdirSync(nested, { recursive: true });
+	const { state } = store.writeState(nested, { ...store.defaultState(), enabled: true, stage: '共享' });
+	equal(store.resolveStatePath(dir), store.resolveStatePath(nested), '两个目录解析到同一份状态文件');
+	equal(store.readState(dir).state.stage, '共享', '另一个会话读到同一份');
+	equal(state.stage, '共享', '写进去的值');
+	rmSync(dir, { recursive: true, force: true });
+});
+
 /* ---------------- 网页面板（假 DOM / 假 react） ---------------- */
 
 /**
