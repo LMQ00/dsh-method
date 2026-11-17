@@ -45,7 +45,7 @@ export const CHART_SUBMIT_SCHEMA = {
 		},
 		nodes: {
 			type: 'array',
-			description: '节点：这一步做什么。id 只在这张图内唯一，后续 chart_update 用它点亮。',
+			description: '节点：这一步做什么。id 只在这个方案内唯一，后续 chart_update 用它点亮。',
 			items: {
 				type: 'object',
 				additionalProperties: false,
@@ -77,7 +77,7 @@ export const CHART_UPDATE_SCHEMA = {
 	type: 'object',
 	additionalProperties: false,
 	properties: {
-		selectedChart: { type: 'string', description: '选中哪张方案图；必须是成员交上来的方案 id。' },
+		selectedChart: { type: 'string', description: '选中哪个方案；必须是成员交上来的方案 id。' },
 		stage: { type: 'string', description: '当前阶段，一句话，例如「实现中」。' },
 		next: { type: 'string', description: '下一步等什么，一句话。' },
 		members: {
@@ -264,12 +264,12 @@ export function applyUpdate(args, state) {
 	if (args.nodes !== undefined) {
 		const patch = args.nodes;
 		if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) throw new ChartError('nodes 必须是对象：{ "n1": { "status": "完成" } }');
-		if (next.selectedChart === null) throw new ChartError('还没选中方案图：先 chart_update 传 selectedChart');
+		if (next.selectedChart === null) throw new ChartError('还没选中方案：先 chart_update 传 selectedChart');
 		for (const [id, change] of Object.entries(patch)) {
 			if (!Object.hasOwn(next.nodes, id)) {
 				const known = Object.keys(next.nodes);
 				throw new ChartError(
-					`nodes.${id} 不在选中图 "${next.selectedChart}" 里`
+					`nodes.${id} 不在选中方案 "${next.selectedChart}" 里`
 					+ (known.length === 0 ? '' : `（现有节点：${known.join('、')}）`),
 				);
 			}

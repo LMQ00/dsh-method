@@ -2,8 +2,8 @@
  * dsh-method —— 子代理编排插件。
  *
  * 用户敲 /orchestrate 之后，主对话只做两件事：路由模型与调度。派活走宿主自己的
- * spawn_teammate（团队子代理缺席时回退 subagent），成员交上来的方案图落成一张选中的图，
- * 之后主对话只点亮节点。进度写在项目根 .orchestrate/state.json，网页与手机面板读同一份。
+ * spawn_teammate（团队子代理缺席时回退 subagent），成员交上来的方案定成一个选中的方案，
+ * 之后主对话只点亮节点、并把节点写成待办。进度写在项目根 .orchestrate/state.json。
  *
  * 主对话手上的读写工具不拦：它自己调写文件工具时，只回一条警告说明这活该派给成员。
  *
@@ -25,6 +25,7 @@ import {
 	archiveChart,
 	defaultState,
 	flattenChart,
+	orderChartNodes,
 	readState,
 	resolvePlansDir,
 	resolveStatePath,
@@ -57,9 +58,6 @@ const UPDATE_TOOL = 'chart_update';
 /** 会话投影的 key 与版本。 */
 const PROJECTION_KEY = 'orchestrate';
 const PROJECTION_VERSION = 1;
-
-/** 读状态的路由：网页面板轮询它。 */
-const STATE_ROUTE = '/api/orchestrate.state';
 
 /** 折叠出的模式状态里，那条命令带来的选择。 */
 function isPlainObject(value) {
@@ -138,13 +136,29 @@ function noticeMessage(text, summary) {
 /* ------------------------------------------------------------------ */
 
 /**
+ * 提示词里要写的那份方案：按连线顺序排好，带上完成计数。
+ * @param {object} state 项目状态。
+ * @returns {object|null} 没有选中方案时为 null。
+ */
+function chartForPrompt(state) {
+	const flat = flattenChart(state);
+	if (flat.nodes.length === 0) return null;
+	const ordered = orderChartNodes(flat);
+	const chart = state.charts[state.selectedChart];
+	return {
+		id: state.selectedChart,
+		name: typeof chart?.name === 'string' ? chart.name : '',
+		nodes: ordered,
+		done: ordered.filter((node) => node.status === '完成').length,
+		total: ordered.length,
+	};
+}
+
+/**
  * 插件入口。
  * @param {object} ctx Cordis 上下文。
  */
 export function apply(ctx) {
-	/** 最近一次被工具或命令触碰过的项目目录，读状态的路由没带 cwd 时用它。 */
-	let lastProjectDir = process.cwd();
-
 	/** 已经警告过的「会话 + 回合」，避免同一轮反复刷。 */
 	const warnedTurns = new WeakMap();
 	/** 每个会话当前回合号。 */
@@ -204,6 +218,15 @@ export function apply(ctx) {
 		}
 	}
 
+	/** 待办工具在不在：不在就不让主对话去写 todo。 */
+	function hasTodoTool(agent) {
+		try {
+			return ctx.tools.get('todo_write', agent) !== undefined;
+		} catch {
+			return false;
+		}
+	}
+
 	/** 团队子代理工具在不在。 */
 	function hasTeamTools(agent) {
 		try {
@@ -213,19 +236,13 @@ export function apply(ctx) {
 		}
 	}
 
-	/** 读状态前把项目目录记下来（读状态的路由要用）。 */
-	function track(cwd) {
-		lastProjectDir = cwd;
-		return cwd;
-	}
-
-	/** 把 enabled 写进状态文件；写失败不打断命令。 */
+		/** 把 enabled 写进状态文件；写失败不打断命令。 */
 	function setEnabled(cwd, enabled) {
 		try {
 			const { state } = readState(cwd);
 			writeState(cwd, { ...state, enabled });
 		} catch {
-			// 状态目录不可写时，面板看不到，但模式本身照常开。
+			// 状态目录不可写时进度存不下，但模式本身照常开。
 		}
 	}
 
@@ -244,11 +261,17 @@ export function apply(ctx) {
 				if (agent === undefined) return '';
 				const session = agent.session;
 				if (!isActive(session)) return '';
-				const cwd = track(sessionCwd(session));
+				const cwd = sessionCwd(session);
+				const { state } = readState(cwd);
 				return dispatchPolicy({
 					hasTeam: hasTeamTools(agent),
+					hasTodo: hasTodoTool(agent),
 					plansDir: resolvePlansDir(cwd),
 					statePath: resolveStatePath(cwd),
+					chart: chartForPrompt(state),
+					stage: state.stage,
+					next: state.next,
+					members: state.members,
 				});
 			} catch {
 				// 提供者抛异常会让整次装配失败，只能贡献空串。
@@ -294,12 +317,12 @@ export function apply(ctx) {
 		commandCtx.commands.register({
 			definitionId: 'dsh-method',
 			name: COMMAND_NAME,
-			description: '编排模式：主对话只做路由与调度，活派给子代理；成员交方案流程图，主对话选中并点亮进度，网页与手机面板看得到',
+			description: '编排模式：主对话只做路由与调度，活派给子代理；成员交方案，主对话选中一个、点亮进度并把节点写成待办',
 			input: { hint: '[off]', attachments: false },
 			handler: ({ agent, rawInput }) => {
 				const session = agent.session;
 				const message = rawInput.trim();
-				const cwd = track(sessionCwd(session));
+				const cwd = sessionCwd(session);
 
 				if (message === 'off') {
 					if (!loggedActive(session)) return { kind: 'success', text: '编排模式没开着。' };
@@ -356,9 +379,9 @@ export function apply(ctx) {
 			const agent = exec.agent;
 			if (agent === undefined) throw new Error(`${SUBMIT_TOOL} 需要调用它的 agent`);
 			const session = agent.session;
-			const submitCwd = track(sessionCwd(session));
+			const submitCwd = sessionCwd(session);
 			// 成员的会话没有模式投影，认的是项目状态文件里的 enabled；
-			// 主对话自己交图也走同一条，提示词里已经说明该由成员交。
+			// 主对话自己交方案也走同一条，提示词里已经说明该由成员交。
 			const projectEnabled = readState(submitCwd).state.enabled;
 			if (!isActive(session) && !projectEnabled) {
 				throw new Error(`${SUBMIT_TOOL} 只能在编排模式里用；先让用户敲 /orchestrate。`);
@@ -372,7 +395,7 @@ export function apply(ctx) {
 				throw error;
 			}
 
-			const cwd = track(sessionCwd(session));
+			const cwd = sessionCwd(session);
 			const { state } = readState(cwd);
 			const nodes = { ...state.nodes };
 			for (const node of chart.nodes) {
@@ -424,10 +447,10 @@ export function apply(ctx) {
 				required: ['updated', 'revision', 'selectedChart', 'stage', 'next', 'memberCount', 'nodeCount', 'statePath'],
 			},
 			render: (_args, value) => {
-				const flat = value.nodeCount === 0 ? '还没有选中图' : `${value.nodeCount} 个节点`;
+				const flat = value.nodeCount === 0 ? '还没有选中方案' : `${value.nodeCount} 个节点`;
 				return [{
 					type: 'text',
-					text: `进度已更新（revision ${value.revision}）：选中图 ${value.selectedChart === '' ? '无' : value.selectedChart}，${flat}，${value.memberCount} 名成员。阶段：${value.stage === '' ? '未写' : value.stage}；下一步：${value.next === '' ? '未写' : value.next}。`,
+					text: `进度已更新（revision ${value.revision}）：选中方案 ${value.selectedChart === '' ? '无' : value.selectedChart}，${flat}，${value.memberCount} 名成员。阶段：${value.stage === '' ? '未写' : value.stage}；下一步：${value.next === '' ? '未写' : value.next}。`,
 				}];
 			},
 		},
@@ -440,7 +463,7 @@ export function apply(ctx) {
 			// 进度只由主对话写：成员各自 update 会让状态互相覆盖。
 			if (isMember(session)) throw new Error(`${UPDATE_TOOL} 是主对话的工具，成员只交 chart_submit。`);
 
-			const cwd = track(sessionCwd(session));
+			const cwd = sessionCwd(session);
 			const { state } = readState(cwd);
 			let updated;
 			try {
@@ -470,38 +493,7 @@ export function apply(ctx) {
 			};
 		},
 	});
-
-	/* ---------------- 面板读状态的路由 ---------------- */
-
-	ctx.inject(['connection'], (routeCtx) => {
-		routeCtx.connection.fetch.register({
-			path: STATE_ROUTE,
-			methods: ['GET'],
-			requestBody: 'buffered',
-			fetch: async (request) => {
-				const url = new URL(request.url, 'http://localhost');
-				const asked = url.searchParams.get('cwd');
-				const cwd = asked !== null && asked !== '' ? asked : lastProjectDir;
-				const { state, broken, path } = readState(cwd);
-				const body = {
-					cwd,
-					statePath: path,
-					broken,
-					enabled: state.enabled,
-					selectedChart: state.selectedChart,
-					stage: state.stage,
-					next: state.next,
-					members: state.members,
-					charts: Object.values(state.charts).map((chart) => ({ id: chart.id, name: chart.name })),
-					revision: state.revision,
-					updatedAt: state.updatedAt,
-					...flattenChart(state),
-				};
-				return Response.json(body, { headers: { 'cache-control': 'no-store' } });
-			},
-		});
-	});
 }
 
 /** 导出给自测用的常量。 */
-export const internals = { COMMAND_NAME, SUBMIT_TOOL, UPDATE_TOOL, PROJECTION_KEY, STATE_ROUTE, createModeProjection, defaultState };
+export const internals = { COMMAND_NAME, SUBMIT_TOOL, UPDATE_TOOL, PROJECTION_KEY, createModeProjection, defaultState };

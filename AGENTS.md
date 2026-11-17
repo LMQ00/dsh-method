@@ -7,9 +7,9 @@
 | .spec/flows/overview.md | 图集入口 | 想知道这个插件整体怎么转、模块怎么衔接时 |
 | .spec/flows/mode-enter.md | 图集 | 改命令、提示词段、团队工具回退时 |
 | .spec/flows/dispatch.md | 图集 | 改派活规则、成员怎么被派出与回报时 |
-| .spec/flows/chart-flow.md | 图集 | 改 chart_submit 校验、方案归档、选中逻辑时 |
+| .spec/flows/plan-flow.md | 图集 | 改 chart_submit 校验、方案归档、选中逻辑时 |
 | .spec/flows/progress.md | 图集 | 改 chart_update 字段、state.json 结构时 |
-| .spec/flows/ui-panels.md | 图集 | 改网页或手机面板、动画、入口显隐时 |
+| .spec/flows/todo.md | 图集 | 改提示词怎么带当前方案、节点怎么变成待办时 |
 | README.md | 说明 | 安装、用法、改它之前要知道的几条规矩 |
 
 每份图集文件含：范围一行、mermaid 流程图、需求简报（目标 / 要做什么 / 验收 / 约束）。
@@ -35,7 +35,7 @@
 - 提示词段落的提供者不许抛异常：抛出去会让整个装配失败，只能贡献空串。
 - `ctx.tools.register` 只校验输出 schema，`parameters` 原样透给 provider，`execute` 拿到裸入参。依赖参数形状的判断必须自己调 `validateJsonSchemaValue`，否则 `additionalProperties: false` 只是装饰。
 - 工具参数 schema 用标准 JSON Schema，不用 `defineTool` 的 DSL：`register` 不接 DSL。
-- 状态文件写盘用「写临时文件再 rename」，面板侧只在 rename 之后读得到完整 JSON。
+- 状态文件写盘用「写临时文件再 rename」，读的一方只会看到完整文件。
 - 不引宿主包；需要宿主工具时按等价实现内联，或从宿主安装目录运行期解析。
 
 ## 验证

@@ -2,7 +2,7 @@
 /**
  * 纯逻辑自测：状态落盘、字段完整性校验、进度更新。跑法：node selftest.mjs
  *
- * 只测不依赖宿主的模块（store.js / schema.js）。工具、命令、提示词段、面板要在真实 dsh 里验。
+ * 只测不依赖宿主的模块（store.js / schema.js / prompt.js）。工具、命令、提示词段要在真实 dsh 里验。
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -12,11 +12,9 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const tempRoot = join(here, 'tmp');
 mkdirSync(tempRoot, { recursive: true });
-// 镜像文件写到临时目录，别碰真实的 $DSH_HOME。
-process.env.DSH_HOME = mkdtempSync(join(tempRoot, 'dsh-home-'));
-
 const store = await import('./store.js');
 const schema = await import('./schema.js');
+const prompt = await import('./prompt.js');
 
 let passed = 0;
 let attempted = 0;
@@ -94,6 +92,83 @@ check('状态往返不丢字段', () => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
+check('节点按连线顺序排，自环不算入边', () => {
+	const flat = {
+		nodes: [{ id: 'n3' }, { id: 'n1' }, { id: 'n2' }, { id: 'loop' }],
+		edges: [{ from: 'n1', to: 'n2' }, { from: 'n2', to: 'n3' }, { from: 'loop', to: 'loop' }],
+	};
+	// loop 只指向自己，等于没有入边，跟 n1 一起当起点，不会被挤到最后。
+	equal(store.orderChartNodes(flat).map((node) => node.id), ['n1', 'loop', 'n2', 'n3'], '排序');
+});
+
+check('成环的节点一个不丢', () => {
+	const flat = {
+		nodes: [{ id: 'x' }, { id: 'y' }, { id: 'z' }],
+		edges: [{ from: 'x', to: 'y' }, { from: 'y', to: 'x' }, { from: 'y', to: 'z' }],
+	};
+	const order = store.orderChartNodes(flat).map((node) => node.id);
+	equal(order.length, 3, '节点数');
+	equal(order.slice().sort(), ['x', 'y', 'z'], '节点集合');
+});
+
+check('提示词带上当前方案与节点状态', () => {
+	const text = prompt.dispatchPolicy({
+		hasTeam: true,
+		hasTodo: true,
+		plansDir: '/p/.orchestrate/plans',
+		statePath: '/p/.orchestrate/state.json',
+		stage: '实现中',
+		next: '等 n2',
+		members: [{ name: 'coder', role: '写模块', status: '进行中' }],
+		chart: {
+			id: 'plan-a',
+			name: '方案 A',
+			nodes: [{ id: 'n1', title: '查资料', status: '完成' }, { id: 'n2', title: '写结论', status: '进行中' }],
+			edges: [{ from: 'n1', to: 'n2' }],
+			done: 1,
+			total: 2,
+		},
+	});
+	if (!text.includes('## 当前方案：方案 A（1/2 完成）')) throw new Error('没写图名与进度：' + text.slice(0, 400));
+	if (!text.includes('[完成] n1 查资料')) throw new Error('没写节点状态');
+	if (!text.includes('下一步：等 n2')) throw new Error('没写下一步');
+	if (!text.includes('coder（写模块）进行中')) throw new Error('没写成员');
+	if (!text.includes('## 待办')) throw new Error('没写待办那一段');
+	if (!text.includes('pending / in_progress / completed')) throw new Error('没给待办状态名');
+	if (!text.includes('节点 id + 空格 + 节点标题')) throw new Error('没说 content 怎么写');
+	if (!text.includes('完成 → completed')) throw new Error('没给状态映射');
+	if (!text.includes('整份替换')) throw new Error('没说 todo_write 是整份替换');
+});
+
+check('没有待办工具时不写待办那一段', () => {
+	const text = prompt.dispatchPolicy({
+		hasTeam: true,
+		hasTodo: false,
+		plansDir: '/p/.orchestrate/plans',
+		statePath: '/p/.orchestrate/state.json',
+		chart: null,
+		stage: '',
+		next: '',
+		members: [],
+	});
+	if (text.includes('## 待办')) throw new Error('没有 todo_write 却写了待办段');
+	if (!text.includes('## 进度')) throw new Error('进度段没了');
+});
+
+check('没有图时提示词不带图那一段', () => {
+	const text = prompt.dispatchPolicy({
+		hasTeam: false,
+		plansDir: '/p/.orchestrate/plans',
+		statePath: '/p/.orchestrate/state.json',
+		chart: null,
+		stage: '',
+		next: '',
+		members: [],
+	});
+	if (text.includes('## 当前方案')) throw new Error('没有方案却写了方案那段');
+	if (!text.includes('# 编排模式：你是调度者')) throw new Error('主体没了');
+});
+
 check('损坏的状态文件先备份再当空状态', () => {
 	const dir = makeProject('broken');
 	const path = store.resolveStatePath(dir);
@@ -112,21 +187,6 @@ check('状态写盘留下自忽略的 .gitignore', () => {
 	store.writeState(dir, store.defaultState());
 	const ignore = readFileSync(join(dir, '.orchestrate', '.gitignore'), 'utf8');
 	equal(ignore.trim(), '*', '.gitignore 内容');
-	rmSync(dir, { recursive: true, force: true });
-});
-
-check('镜像文件写进 DSH_HOME', () => {
-	const dir = makeProject('mirror');
-	store.writeState(dir, {
-		...store.defaultState(),
-		enabled: true,
-		selectedChart: 'plan-a',
-		nodes: { n1: { title: '一', status: '完成' } },
-		charts: { 'plan-a': { id: 'plan-a', name: 'A', nodes: [{ id: 'n1', title: '一' }], edges: [] } },
-	});
-	const mirror = JSON.parse(readFileSync(store.resolveMirrorPath(), 'utf8'));
-	equal(mirror.cwd, dir, '镜像里的项目目录');
-	equal(mirror.nodes[0].status, '完成', '镜像里的节点状态');
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -187,9 +247,9 @@ function stateWithChart() {
 	};
 }
 
-check('选中图 + 点亮节点', () => {
+check('选中方案 + 点亮节点', () => {
 	const first = schema.applyUpdate({ selectedChart: 'plan-a' }, stateWithChart());
-	equal(first.state.selectedChart, 'plan-a', '选中图');
+	equal(first.state.selectedChart, 'plan-a', '选中方案');
 	const second = schema.applyUpdate({ nodes: { n1: { status: '完成' } }, stage: '实现中', next: '等 n2', members: [{ name: 'coder' }] }, first.state);
 	equal(second.state.nodes.n1.status, '完成', '节点状态');
 	equal(second.state.members[0].status, '待办', '成员默认状态');
@@ -197,8 +257,8 @@ check('选中图 + 点亮节点', () => {
 });
 
 await rejects('非法节点状态', () => schema.applyUpdate({ nodes: { n1: { status: '跑了' } } }, { ...stateWithChart(), selectedChart: 'plan-a' }), 'nodes.n1.status');
-await rejects('节点 id 不在选中图里', () => schema.applyUpdate({ nodes: { n9: { status: '完成' } } }, { ...stateWithChart(), selectedChart: 'plan-a' }), 'nodes.n9');
-await rejects('没选图就改节点', () => schema.applyUpdate({ nodes: { n1: { status: '完成' } } }, stateWithChart()), '还没选中方案图');
+await rejects('节点 id 不在选中方案里', () => schema.applyUpdate({ nodes: { n9: { status: '完成' } } }, { ...stateWithChart(), selectedChart: 'plan-a' }), 'nodes.n9');
+await rejects('没选图就改节点', () => schema.applyUpdate({ nodes: { n1: { status: '完成' } } }, stateWithChart()), '还没选中方案');
 await rejects('选不存在的方案', () => schema.applyUpdate({ selectedChart: 'plan-z' }, stateWithChart()), 'selectedChart');
 await rejects('一个字段都没给', () => schema.applyUpdate({}, stateWithChart()), '至少给一个');
 
@@ -209,14 +269,13 @@ const plugin = await import('./index.js');
 
 /**
  * 造一个能装下插件注册物的假 ctx。
- * @returns {object} { ctx, tools, commands, sections, listeners, routes }
+ * @returns {object} { ctx, tools, commands, sections, listeners, projections }
  */
 function makeContext() {
 	const tools = new Map();
 	const commands = [];
 	const sections = [];
 	const listeners = new Map();
-	const routes = [];
 	const projections = new Map();
 	const ctx = {
 		tools: {
@@ -254,11 +313,10 @@ function makeContext() {
 				callback({ commands: { register: (definition) => commands.push(definition) } });
 			}
 			if (services.includes('connection')) {
-				callback({ connection: { fetch: { register: (route) => routes.push(route) } } });
-			}
+						}
 		},
 	};
-	return { ctx, tools, commands, sections, listeners, routes, projections };
+	return { ctx, tools, commands, sections, listeners, projections };
 }
 
 /** 一个假会话。 */
@@ -361,7 +419,7 @@ await (async () => {
 
 	const updated = await update.execute({ selectedChart: 'plan-a' }, { agent: wired.agent });
 	check('chart_update 选中方案', () => {
-		equal(updated.selectedChart, 'plan-a', '选中图');
+		equal(updated.selectedChart, 'plan-a', '选中方案');
 		equal(updated.revision >= 2, true, 'revision 递增');
 	});
 	await update.execute({ nodes: { n1: { status: '完成' } }, stage: '实现中', members: [{ name: 'coder', role: '写模块', status: '进行中' }] }, { agent: wired.agent });
@@ -416,36 +474,6 @@ await (async () => {
 	check('读文件不警告', () => equal(wired.agent.injected.length, 1, '警告没增加'));
 	rmSync(dir, { recursive: true, force: true });
 })();
-
-/* ---------------- 面板路由 ---------------- */
-
-await (async () => {
-	const dir = makeProject('route');
-	store.writeState(dir, {
-		...store.defaultState(),
-		enabled: true,
-		selectedChart: 'plan-a',
-		stage: '实现中',
-		nodes: { n1: { title: '查源码', status: '完成' } },
-		charts: { 'plan-a': { id: 'plan-a', name: 'A', nodes: [{ id: 'n1', title: '查源码' }], edges: [] } },
-	});
-	const wired = await wire(dir, { active: true, running: null });
-	const route = wired.routes.find((item) => item.path === '/api/orchestrate.state');
-	check('注册了读状态的路由', () => {
-		if (route === undefined) throw new Error('没有 /api/orchestrate.state');
-	});
-	const response = await route.fetch(new Request('http://localhost/api/orchestrate.state?cwd=' + encodeURIComponent(dir)));
-	const body = await response.json();
-	check('路由返回面板要的字段', () => {
-		equal(body.enabled, true, 'enabled');
-		equal(body.selectedChart, 'plan-a', 'selectedChart');
-		equal(body.nodes[0].status, '完成', '节点状态');
-		equal(body.stage, '实现中', 'stage');
-	});
-	rmSync(dir, { recursive: true, force: true });
-})();
-
-
 
 check('团队工具缺席与在场给不同回执', () => {
 	const dir = makeProject('team');
@@ -513,339 +541,6 @@ await (async () => {
 	rmSync(dir, { recursive: true, force: true });
 	rmSync(off, { recursive: true, force: true });
 });
-
-/* ---------------- 网页面板（假 DOM / 假 react） ---------------- */
-
-/**
- * 造一个能跑 client.js 的浏览器环境。
- * @param {object} payloads 项目目录到路由返回数据的映射；键 '' 是不带目录的那次。
- * @returns {object} 环境句柄。
- */
-function makeBrowser(payloads) {
-	const registrations = [];
-	const disposers = [];
-	const tabTypes = [];
-	const calls = [];
-	const fetches = [];
-	const elements = [];
-	let openTabs = [];
-	let expanded = false;
-	let activeKind = null;
-	/** 右侧栏当前对着哪个会话。 */
-	let mountedSession = 's1';
-	/** 会话到项目目录：假会话清单；s3 故意不给，用来测「问不到目录」。 */
-	const sessionDirs = { s1: '/tmp/p1', s2: '/tmp/p2', s4: '/tmp/p1' };
-	/** 假定时器：只记账，不真的跑。 */
-	const timers = new Set();
-	globalThis.setInterval = (fn, ms) => {
-		const handle = { fn, ms };
-		timers.add(handle);
-		return handle;
-	};
-	globalThis.clearInterval = (handle) => { timers.delete(handle); };
-	globalThis.window = {
-		__ModuleLoader__: { load: (registration) => { globalThis.__clientModule = registration; } },
-		matchMedia: () => ({ matches: false }),
-	};
-	globalThis.document = {
-		getElementById: () => null,
-		createElement: () => {
-			const element = { style: {}, textContent: '', id: '' };
-			elements.push(element);
-			return element;
-		},
-		head: { appendChild: () => {} },
-	};
-	globalThis.fetch = async (url) => {
-		fetches.push(String(url));
-		const cwd = new URL(String(url), 'http://localhost').searchParams.get('cwd') ?? '';
-		const payload = payloads[cwd] ?? payloads[''];
-		if (payload === undefined) throw new Error('自测没给这个项目准备数据：' + cwd);
-		return { ok: true, json: async () => payload };
-	};
-	const unsubscribes = [];
-	/** 已经挂过的订阅，避免重复挂。 */
-	const subscribed = new Set();
-	const reactFake = {
-		createElement(type, props, ...children) {
-			return { type, props: props ?? {}, children: children.flat(Infinity).filter((child) => child !== null && child !== undefined) };
-		},
-		useRef: (value) => ({ current: value }),
-		useEffect: () => {},
-		// 订阅一次就够：真 react 在这里挂订阅、收到通知重渲染，假货只负责挂上。
-		useSyncExternalStore: (subscribe, getSnapshot) => {
-			if (!subscribed.has(subscribe)) {
-				subscribed.add(subscribe);
-				unsubscribes.push(subscribe(() => {}));
-			}
-			return getSnapshot();
-		},
-	};
-	const ctx = {
-		slots: {
-			inject: (name, callback) => callback(),
-			register: (options, component) => {
-				registrations.push({ options, component });
-				return () => {
-					const index = registrations.findIndex((item) => item.options === options);
-					if (index !== -1) registrations.splice(index, 1);
-				};
-			},
-		},
-		sidebarRightTabs: {
-			register: (definition) => {
-				tabTypes.push(definition);
-				return () => {
-					const index = tabTypes.indexOf(definition);
-					if (index !== -1) tabTypes.splice(index, 1);
-				};
-			},
-		},
-		sidebarRight: {
-			openTab: (kind) => { calls.push(['openTab', kind]); },
-			hide: (tabId) => { calls.push(['hide', tabId]); },
-			tabsIn: (sessionId) => { calls.push(['tabsIn', sessionId]); return openTabs; },
-			active: () => (activeKind === null ? undefined : { kind: activeKind }),
-			isExpanded: () => expanded,
-			mounted: { getSnapshot: () => mountedSession },
-		},
-		sessions: {
-			list: { getSnapshot: () => ({ byId: Object.fromEntries(Object.entries(sessionDirs).map(([id, cwd]) => [id, { cwd }])) }) },
-			binding: (sessionId) => (sessionDirs[sessionId] === undefined ? undefined : {
-				session: { projections: { faceOf: () => ({ getSnapshot: () => sessionDirs[sessionId] }) } },
-			}),
-		},
-		effect: (fn) => {
-			const dispose = fn();
-			disposers.push(dispose);
-			return dispose;
-		},
-	};
-	/** 摆好右侧栏当时的模样：开了哪些页、栏有没有展开、当前页是哪个。 */
-	const setRight = (state) => {
-		openTabs = state.tabs ?? [];
-		expanded = state.expanded ?? false;
-		activeKind = state.active ?? null;
-		mountedSession = state.mounted ?? 's1';
-	};
-	return { registrations, disposers, tabTypes, calls, fetches, elements, timers, reactFake, ctx, setRight, unsubscribes };
-}
-
-/** 把 client.js 当浏览器模块加载一遍（每次加 query 拿新实例）。 */
-async function loadClient(payloads) {
-	const browser = makeBrowser(payloads);
-	await import('./client.js?case=' + encodeURIComponent(String(Date.now()) + Math.random()));
-	const factory = globalThis.__clientModule.factory;
-	const moduleExports = factory((name) => {
-		if (name === 'react') return browser.reactFake;
-		if (name === 'react/jsx-runtime') return browser.reactFake;
-		throw new Error('未预期的 require：' + name);
-	});
-	return { ...browser, moduleExports };
-}
-
-/** 等一小会儿，让轮询落地。 */
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * 摊平一棵假元素树，收出所有文本。
- * @param {object} page 组件树根。
- * @returns {string[]} 文本片段。
- */
-function collectTexts(page) {
-	const texts = [];
-	const walk = (node) => {
-		if (node === null || typeof node !== 'object') return;
-		if (Array.isArray(node)) {
-			for (const child of node) walk(child);
-			return;
-		}
-		// 假 createElement 不会自己渲染函数组件，这里手动展开一层。
-		if (typeof node.type === 'function') {
-			walk(node.type(node.props));
-			return;
-		}
-		for (const child of node.children ?? []) if (typeof child === 'string') texts.push(child);
-		walk(node.children ?? []);
-	};
-	walk(page);
-	return texts;
-}
-
-await (async () => {
-	/** 开了编排的项目。 */
-	const on = {
-		cwd: '/tmp/p1',
-		enabled: true,
-		selectedChart: 'plan-a',
-		stage: '实现中',
-		next: '等 n2',
-		members: [{ name: 'coder', role: '写模块', status: '进行中' }],
-		charts: [{ id: 'plan-a', name: '方案 A' }],
-		nodes: [{ id: 'n1', title: '查资料', status: '完成' }, { id: 'n2', title: '写结论', status: '进行中' }],
-		edges: [{ from: 'n1', to: 'n2' }],
-	};
-	/** 没开编排的另一个项目。 */
-	const off = { cwd: '/tmp/p2', enabled: false, selectedChart: null, stage: '', next: '', members: [], charts: [], nodes: [], edges: [] };
-	const loaded = await loadClient({ '/tmp/p1': on, '/tmp/p2': off, '': off });
-	loaded.moduleExports.apply(loaded.ctx);
-	await sleep(50);
-
-	check('挂头部按钮与右侧栏标签页', () => {
-		const names = loaded.registrations.map((item) => item.options.name).sort();
-		equal(names, ['conversation.session.header.utilities', 'sidebar.right.pane.tab'], '注册的槽位');
-		equal(loaded.tabTypes.length, 1, '标签页类型数');
-		equal(loaded.tabTypes[0].id, 'dsh-method', '标签页注册 id');
-		equal(loaded.tabTypes[0].kind, 'orchestrate', '标签页类型');
-		equal(loaded.tabTypes[0].title(), '编排', '标签页标题');
-		const header = loaded.registrations.find((item) => item.options.name === 'conversation.session.header.utilities');
-		equal(header.options.id, 'orchestrate', '头部按钮 id');
-		equal(header.options.order, -6, '头部按钮顺序');
-		const body = loaded.registrations.find((item) => item.options.name === 'sidebar.right.pane.tab');
-		equal(body.options.key, 'dsh-method', '标签体的 key');
-	});
-
-	check('按会话所在项目问状态', () => {
-		const body = loaded.registrations.find((item) => item.options.name === 'sidebar.right.pane.tab').component;
-		body({ sessionId: 's1' });
-		body({ sessionId: 's2' });
-		if (!loaded.fetches.some((url) => url.includes('cwd=%2Ftmp%2Fp1'))) throw new Error('没按 s1 的项目问：' + loaded.fetches.join(' | '));
-		if (!loaded.fetches.some((url) => url.includes('cwd=%2Ftmp%2Fp2'))) throw new Error('没按 s2 的项目问：' + loaded.fetches.join(' | '));
-	});
-
-	check('问不到项目目录的会话不订阅、不轮询', () => {
-		const header = loaded.registrations.find((item) => item.options.name === 'conversation.session.header.utilities').component;
-		const before = loaded.timers.size;
-		equal(header({ sessionId: 's3', toggle: () => {} }), null, 's3 的按钮');
-		equal(loaded.timers.size, before, '没起轮询');
-		if (loaded.fetches.some((url) => !url.includes('cwd=') || url.endsWith('cwd='))) throw new Error('发了不带目录的请求：' + loaded.fetches.join(' | '));
-	});
-
-	await sleep(40);
-
-	check('项目没开编排时头部不画图标', () => {
-		const header = loaded.registrations.find((item) => item.options.name === 'conversation.session.header.utilities');
-		const quiet = header.options.inject('s2');
-		equal(header.component({ ...quiet, sessionId: 's2' }), null, 's2 的按钮');
-	});
-
-	check('点头部图标打开标签页，开着时再点收起', () => {
-		const header = loaded.registrations.find((item) => item.options.name === 'conversation.session.header.utilities');
-		const face = header.options.inject('s1');
-		const button = header.component({ ...face, sessionId: 's1' });
-		equal(button.props['aria-label'], '编排', '按钮名称');
-
-		loaded.setRight({ tabs: [], expanded: false });
-		button.props.onClick();
-		equal(loaded.calls.at(-1), ['openTab', 'orchestrate'], '没开时点一下：打开标签页');
-
-		loaded.setRight({ tabs: [{ id: 'tab-1', kind: 'orchestrate' }], expanded: true, active: 'other' });
-		button.props.onClick();
-		equal(loaded.calls.at(-1), ['openTab', 'orchestrate'], '被别的页盖住时点一下：聚焦回编排');
-
-		loaded.setRight({ tabs: [{ id: 'tab-1', kind: 'orchestrate' }], expanded: true, active: 'orchestrate' });
-		button.props.onClick();
-		equal(loaded.calls.at(-1), ['hide', 'tab-1'], '正开着时点一下：收起');
-
-		loaded.setRight({ tabs: [{ id: 'tab-1', kind: 'orchestrate' }], expanded: true, active: 'orchestrate' });
-		loaded.ctx.sidebarRight.isExpanded = () => false;
-		button.props.onClick();
-		equal(loaded.calls.at(-1), ['openTab', 'orchestrate'], '栏收起了但页还在：再展开');
-	});
-
-	check('同一项目的两个会话共用一条轮询', () => {
-		const body = loaded.registrations.find((item) => item.options.name === 'sidebar.right.pane.tab').component;
-		const timersBefore = loaded.timers.size;
-		const requestsBefore = loaded.fetches.filter((url) => url.includes('%2Ftmp%2Fp1')).length;
-		body({ sessionId: 's4' });
-		equal(loaded.timers.size, timersBefore, '没起第二条轮询');
-		equal(loaded.fetches.filter((url) => url.includes('%2Ftmp%2Fp1')).length, requestsBefore, '复用了已有那份');
-	});
-
-	check('标签页画出节点与连线', () => {
-		const body = loaded.registrations.find((item) => item.options.name === 'sidebar.right.pane.tab').component;
-		const page = body({ sessionId: 's1' });
-		const stack = [];
-		const walk = (node) => {
-			if (node === null || typeof node !== 'object') return;
-			if (Array.isArray(node)) {
-				for (const child of node) walk(child);
-				return;
-			}
-			// 假 createElement 不会自己渲染函数组件，这里手动展开一层。
-			if (typeof node.type === 'function') {
-				walk(node.type(node.props));
-				return;
-			}
-			stack.push(node);
-			walk(node.children ?? []);
-		};
-		walk(page);
-		const svg = stack.find((node) => node.type === 'svg');
-		if (svg === undefined) throw new Error('没有画出 svg');
-		const groups = stack.filter((node) => node.type === 'g' && node.props['data-status'] !== undefined);
-		equal(groups.length, 2, '节点数');
-		equal(groups.map((node) => node.props['data-status']).sort(), ['完成', '进行中'], '节点状态');
-		const stage = stack.find((node) => node.children.includes('实现中'));
-		if (stage === undefined) throw new Error('没画阶段一句话');
-	});
-
-	check('样式只插一次', () => equal(loaded.elements.filter((element) => element.id === 'dsh-orchestrate-style').length, 1, '样式标签数'));
-
-	check('没人看就停轮询', () => {
-		for (const off of loaded.unsubscribes) if (typeof off === 'function') off();
-		equal(loaded.timers.size, 0, '还活着的轮询数');
-	});
-	for (const off of loaded.unsubscribes) if (typeof off === 'function') off();
-	for (const dispose of loaded.disposers) if (typeof dispose === 'function') dispose();
-})();
-
-await (async () => {
-	const loaded = await loadClient({ '/tmp/p2': { cwd: '/tmp/p2', enabled: false, selectedChart: null, stage: '', next: '', members: [], charts: [], nodes: [], edges: [] }, '': { enabled: false } });
-	loaded.moduleExports.apply(loaded.ctx);
-	await sleep(50);
-	const body = loaded.registrations.find((item) => item.options.name === 'sidebar.right.pane.tab').component;
-	body({ sessionId: 's2' });
-	await sleep(30);
-
-	check('没开的项目标签页讲清怎么开', () => {
-		const texts = collectTexts(body({ sessionId: 's2' }));
-		if (!texts.some((text) => text.includes('还没开启编排'))) throw new Error('没讲「还没开启编排」：' + texts.join(' | '));
-		if (!texts.some((text) => text.includes('/orchestrate'))) throw new Error('没给开启方式：' + texts.join(' | '));
-	});
-	for (const off of loaded.unsubscribes) if (typeof off === 'function') off();
-	for (const dispose of loaded.disposers) if (typeof dispose === 'function') dispose();
-})();
-
-await (async () => {
-	const loaded = await loadClient({
-		'/tmp/p1': {
-			cwd: '/tmp/p1',
-			enabled: true,
-			selectedChart: null,
-			stage: '',
-			next: '',
-			members: [],
-			charts: [{ id: 'plan-a', name: '方案 A' }],
-			nodes: [],
-			edges: [],
-		},
-		'': { enabled: false },
-	});
-	loaded.moduleExports.apply(loaded.ctx);
-	await sleep(50);
-	const body = loaded.registrations.find((item) => item.options.name === 'sidebar.right.pane.tab').component;
-	body({ sessionId: 's1' });
-	await sleep(30);
-	check('有方案没选中时给一句说明', () => {
-		const texts = collectTexts(body({ sessionId: 's1' }));
-		if (!texts.some((text) => text.includes('还没选中'))) throw new Error('没提示「还没选中」：' + texts.join(' | '));
-	});
-	for (const off of loaded.unsubscribes) if (typeof off === 'function') off();
-	for (const dispose of loaded.disposers) if (typeof dispose === 'function') dispose();
-})();
 
 /* ---------------- 结果 ---------------- */
 

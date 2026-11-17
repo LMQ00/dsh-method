@@ -1,8 +1,8 @@
 {
   "name": "dsh-method",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Subagent orchestration for the DeepSeek Harness: the main conversation routes models and dispatches work; members submit plan flowcharts, the conversation picks one and lights up progress, and both the web and phone panels read the same orchestration state.",
+  "description": "Subagent orchestration for the DeepSeek Harness: the main conversation routes models and dispatches work; members submit plan flowcharts, the conversation picks one, writes it as todos and lights up progress.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -18,7 +18,6 @@
   ],
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js",
     "./store": "./store.js",
     "./schema": "./schema.js",
     "./prompt": "./prompt.js",
@@ -26,7 +25,6 @@
   },
   "files": [
     "index.js",
-    "client.js",
     "store.js",
     "schema.js",
     "prompt.js",
@@ -41,10 +39,6 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "external": ["react"]
     }
   }
 }

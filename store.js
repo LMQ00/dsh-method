@@ -1,7 +1,7 @@
 /**
- * 编排状态落盘：项目根 .orchestrate/state.json、方案存档 plans/、以及给手机面板看的镜像文件。
+ * 编排状态落盘：项目根 .orchestrate/state.json 与方案存档 plans/。
  *
- * 写盘一律「临时文件 + rename」，面板侧永远读到完整 JSON。读盘遇到损坏文件先备份成
+ * 写盘一律「临时文件 + rename」，读的一方永远读到完整 JSON。读盘遇到损坏文件先备份成
  * state.json.bad 再当空状态处理，避免一次手改让插件永久读不出。
  *
  * @module dsh-method/store
@@ -195,7 +195,7 @@ export function readState(cwd) {
 	}
 }
 
-/** 写临时文件再 rename，面板侧只会看到完整文件。 */
+/** 写临时文件再 rename，读的一方只会看到完整文件。 */
 function writeAtomic(path, contents) {
 	mkdirSync(dirname(path), { recursive: true });
 	const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -214,16 +214,7 @@ function ensureIgnore(statePath) {
 	}
 }
 
-/**
- * 手机面板读的镜像文件路径。
- * @returns {string} 绝对路径。
- */
-export function resolveMirrorPath() {
-	const home = process.env.DSH_HOME ?? join(homedir(), '.dsh');
-	return join(home, 'dsh-go', 'orchestrate', 'mirror.json');
-}
-
-/** 选中图的节点与连线，按提交顺序输出成数组，方便面板直接画。 */
+/** 选中方案的节点与连线，按提交顺序输出成数组，给提示词用。 */
 export function flattenChart(state) {
 	const chartId = state.selectedChart;
 	const chart = chartId === null ? undefined : state.charts[chartId];
@@ -237,10 +228,44 @@ export function flattenChart(state) {
 }
 
 /**
- * 写项目状态，并把同一份内容镜像给手机面板。
+ * 把节点按连线顺序排一遍：没有入边的排前面，顺着连线往下走，环里的排在最后。
+ * @param {object} chart flattenChart 的结果。
+ * @returns {Array} 排好的节点。
+ */
+export function orderChartNodes(chart) {
+	const nodes = chart.nodes;
+	const byId = new Map(nodes.map((node) => [node.id, node]));
+	const incoming = new Map(nodes.map((node) => [node.id, 0]));
+	const outgoing = new Map(nodes.map((node) => [node.id, []]));
+	for (const edge of chart.edges) {
+		// 指回自己的连线不算先后关系，否则带自环的起点会被排到末尾。
+		if (!byId.has(edge.from) || !byId.has(edge.to) || edge.from === edge.to) continue;
+		outgoing.get(edge.from).push(edge.to);
+		incoming.set(edge.to, (incoming.get(edge.to) ?? 0) + 1);
+	}
+	const order = [];
+	const seen = new Set();
+	const queue = nodes.filter((node) => (incoming.get(node.id) ?? 0) === 0).map((node) => node.id);
+	while (queue.length > 0) {
+		const id = queue.shift();
+		if (seen.has(id)) continue;
+		seen.add(id);
+		order.push(id);
+		for (const next of outgoing.get(id) ?? []) if (!seen.has(next)) queue.push(next);
+	}
+	for (const node of nodes) {
+		if (seen.has(node.id)) continue;
+		seen.add(node.id);
+		order.push(node.id);
+	}
+	return order.map((id) => byId.get(id));
+}
+
+/**
+ * 写项目状态。
  * @param {string} cwd 会话工作目录。
  * @param {object} state 已经改好的状态。
- * @returns {{state: object, path: string, mirrorPath: string}} 落盘结果。
+ * @returns {{state: object, path: string}} 落盘结果。
  */
 export function writeState(cwd, state) {
 	const path = resolveStatePath(cwd);
@@ -250,25 +275,7 @@ export function writeState(cwd, state) {
 	mkdirSync(dirname(path), { recursive: true });
 	ensureIgnore(path);
 	writeAtomic(path, `${JSON.stringify(normalized, null, 2)}\n`);
-	const mirrorPath = resolveMirrorPath();
-	const flat = flattenChart(normalized);
-	const mirror = {
-		cwd: findProjectAnchor(cwd),
-		enabled: normalized.enabled,
-		selectedChart: normalized.selectedChart,
-		stage: normalized.stage,
-		next: normalized.next,
-		updatedAt: normalized.updatedAt,
-		members: normalized.members,
-		nodes: flat.nodes,
-		edges: flat.edges,
-	};
-	try {
-		writeAtomic(mirrorPath, `${JSON.stringify(mirror, null, 2)}\n`);
-	} catch {
-		// 手机面板是附加能力，写不了不影响仓库里的状态文件。
-	}
-	return { state: normalized, path, mirrorPath };
+	return { state: normalized, path };
 }
 
 /**
