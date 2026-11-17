@@ -19,10 +19,12 @@ const store = await import('./store.js');
 const schema = await import('./schema.js');
 
 let passed = 0;
+let attempted = 0;
 const failures = [];
 
 /** 一个断言。 */
 function check(name, fn) {
+	attempted += 1;
 	try {
 		fn();
 		passed += 1;
@@ -40,6 +42,7 @@ function equal(actual, expected, what) {
 
 /** 断言抛错，且错误信息含指定片段。 */
 async function rejects(name, fn, fragment) {
+	attempted += 1;
 	try {
 		await fn();
 		failures.push(`${name}: 没有抛错`);
@@ -369,12 +372,15 @@ await (async () => {
 		equal(state.stage, '实现中', '阶段');
 	});
 
-	const idle = await wire(dir, { active: false, running: null });
+	// 换一个干净项目：它的状态文件里 enabled 还是 false。
+	const idleDir = makeProject('tools-idle');
+	const idle = await wire(idleDir, { active: false, running: null });
 	await rejects('模式没开时 chart_submit 被拒', () => idle.tools.get('chart_submit').execute({
 		plan: { id: 'plan-b', name: 'B' },
 		nodes: [{ id: 'n1', title: '一' }],
 		edges: [],
 	}, { agent: idle.agent }), '编排模式');
+	rmSync(idleDir, { recursive: true, force: true });
 
 	// additionalProperties 要靠宿主自己的 JSON Schema 校验器；解析不到时会退化成「形状不强制」。
 	const validator = await schema.loadSchemaValidator();
@@ -469,6 +475,43 @@ check('同一项目的两个会话共用一份状态', () => {
 	equal(store.readState(dir).state.stage, '共享', '另一个会话读到同一份');
 	equal(state.stage, '共享', '写进去的值');
 	rmSync(dir, { recursive: true, force: true });
+});
+
+
+/* ---------------- 成员与主对话的分界 ---------------- */
+
+await (async () => {
+	const dir = makeProject('member');
+	// 项目状态里 enabled=true 就是「模式开着」在盘上的镜像；命令处理里是它写的。
+	store.writeState(dir, { ...store.defaultState(), enabled: true });
+	const wired = await wire(dir, { active: false, running: null });
+	const memberSession = { header: { cwd: dir, origin: 'subagent' }, projected: undefined };
+	const memberAgent = { session: memberSession, injected: [], inject: () => {}, steer: () => {} };
+
+	const submitted = await wired.tools.get('chart_submit').execute({
+		plan: { id: 'plan-m', name: '成员方案' },
+		nodes: [{ id: 'n1', title: '查资料' }, { id: 'n2', title: '写结论' }],
+		edges: [{ from: 'n1', to: 'n2' }],
+	}, { agent: memberAgent });
+	check('成员没有模式投影也能交图', () => {
+		equal(submitted.accepted, true, 'accepted');
+		equal(store.listCharts(dir).includes('plan-m'), true, '存档里有 plan-m');
+	});
+
+	await rejects('成员不能改进度', () => wired.tools.get('chart_update').execute({ stage: '抢进度' }, { agent: memberAgent }), '主对话的工具');
+
+	// enabled=false 时成员也交不了：模式关掉就不该再有成员进来交图。
+	const off = makeProject('member-off');
+	store.writeState(off, { ...store.defaultState(), enabled: false });
+	const offWired = await wire(off, { active: false, running: null });
+	await rejects('模式关着时成员交图被拒', () => offWired.tools.get('chart_submit').execute({
+		plan: { id: 'plan-x', name: 'X' },
+		nodes: [{ id: 'n1', title: '一' }],
+		edges: [],
+	}, { agent: { session: { header: { cwd: off, origin: 'subagent' } }, inject: () => {} } }), '编排模式');
+
+	rmSync(dir, { recursive: true, force: true });
+	rmSync(off, { recursive: true, force: true });
 });
 
 /* ---------------- 网页面板（假 DOM / 假 react） ---------------- */
@@ -643,9 +686,9 @@ await (async () => {
 /* ---------------- 结果 ---------------- */
 
 if (failures.length > 0) {
-	console.error(`失败 ${failures.length} 项，通过 ${passed} 项：`);
+	console.error(`失败 ${failures.length} 项，通过 ${passed} 项，共跑了 ${attempted} 项：`);
 	for (const failure of failures) console.error(`  - ${failure}`);
 	process.exitCode = 1;
 } else {
-	console.log(`全部通过：${passed} 项`);
+	console.log(`全部通过：${passed} 项（共跑了 ${attempted} 项，跳过 ${attempted - passed} 项）`);
 }

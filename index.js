@@ -189,6 +189,21 @@ export function apply(ctx) {
 		return process.cwd();
 	}
 
+	/**
+	 * 这个会话是不是子代理（成员）会话。
+	 * 主对话与成员共用同一个项目状态文件，但成员没有自己的模式投影；
+	 * 靠会话头的 origin 区分谁是成员。
+	 * @param {object} session 会话。
+	 * @returns {boolean} 是成员会话时为 true。
+	 */
+	function isMember(session) {
+		try {
+			return session.header?.origin === 'subagent';
+		} catch {
+			return false;
+		}
+	}
+
 	/** 团队子代理工具在不在。 */
 	function hasTeamTools(agent) {
 		try {
@@ -341,7 +356,13 @@ export function apply(ctx) {
 			const agent = exec.agent;
 			if (agent === undefined) throw new Error(`${SUBMIT_TOOL} 需要调用它的 agent`);
 			const session = agent.session;
-			if (!isActive(session)) throw new Error(`${SUBMIT_TOOL} 只能在编排模式里用；先让用户敲 /orchestrate。`);
+			const submitCwd = track(sessionCwd(session));
+			// 成员的会话没有模式投影，认的是项目状态文件里的 enabled；
+			// 主对话自己交图也走同一条，提示词里已经说明该由成员交。
+			const projectEnabled = readState(submitCwd).state.enabled;
+			if (!isActive(session) && !projectEnabled) {
+				throw new Error(`${SUBMIT_TOOL} 只能在编排模式里用；先让用户敲 /orchestrate。`);
+			}
 
 			let chart;
 			try {
@@ -416,6 +437,8 @@ export function apply(ctx) {
 			if (agent === undefined) throw new Error(`${UPDATE_TOOL} 需要调用它的 agent`);
 			const session = agent.session;
 			if (!isActive(session)) throw new Error(`${UPDATE_TOOL} 只能在编排模式里用；先敲 /orchestrate。`);
+			// 进度只由主对话写：成员各自 update 会让状态互相覆盖。
+			if (isMember(session)) throw new Error(`${UPDATE_TOOL} 是主对话的工具，成员只交 chart_submit。`);
 
 			const cwd = track(sessionCwd(session));
 			const { state } = readState(cwd);
